@@ -1,0 +1,7 @@
+out/
+release/
+bu/
+changes/
+ferdig/*.exe
+__pycache__/
+*.key

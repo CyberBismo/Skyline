@@ -1,0 +1,20 @@
+﻿Skyline License (Freeware)
+Copyright © 2026 Yen-Zen & Cyber. All rights reserved.
+
+1. You may download, install and use Skyline free of charge, at home or at work.
+2. You may share Skyline with others, but only the original, unmodified download, and only free of charge.
+3. You may not sell Skyline, charge for it, or include it in another product, bundle or service.
+4. You may not modify, decompile, disassemble or reverse engineer Skyline, or make or share altered versions of it, except where the law expressly allows this.
+5. All rights not expressly granted here are reserved by Yen-Zen & Cyber, including all rights to the name Skyline, its icon and its source code.
+6. Skyline is provided "as is", without warranty of any kind. To the extent the law allows, the authors are not liable for any damage arising from its use.
+
+
+Skyline-lisens (gratisprogram)
+Copyright © 2026 Yen-Zen & Cyber. Alle rettigheter forbeholdt.
+
+1. Du kan laste ned, installere og bruke Skyline gratis, hjemme eller på jobb.
+2. Du kan dele Skyline med andre, men bare den originale, uendrede nedlastingen, og bare gratis.
+3. Du kan ikke selge Skyline, ta betalt for den eller ta den med i et annet produkt, en pakke eller en tjeneste.
+4. Du kan ikke endre, dekompilere, disassemblere eller reversere Skyline, eller lage eller dele endrede versjoner, unntatt der loven uttrykkelig tillater det.
+5. Alle rettigheter som ikke uttrykkelig er gitt her, forbeholdes Yen-Zen & Cyber, inkludert alle rettigheter til navnet Skyline, ikonet og kildekoden.
+6. Skyline leveres «som den er», uten noen form for garanti. Så langt loven tillater, er utviklerne ikke ansvarlige for skade som følger av bruken.
