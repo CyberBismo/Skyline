@@ -600,6 +600,11 @@ void CALLBACK ETiler::OnEvent(HWINEVENTHOOK, DWORD ev, HWND h, LONG obj, LONG ch
         }
         if (!automatic) return;
         if (t->InTree(h) || (t->known_.count(h) && !IsZoomed(h))) t->Schedule(120);
+        else if (t->useDividers_ && GetAncestor(h, GA_ROOT) == h) {   // another app maximized / restored: dividers must (not) cover it
+            static std::set<HWND> zoomed;
+            bool z = IsZoomed(h) != FALSE;
+            if (z != (zoomed.count(h) != 0)) { if (z) zoomed.insert(h); else zoomed.erase(h); t->UpdateDividers(); }
+        }
         return;
     default: {
         if (!automatic) return;
@@ -1643,14 +1648,56 @@ void ETiler::DestroyDividers() {
 
 void ETiler::UpdateDividers() {
     if (!running_ || !useDividers_) { if (!divs_.empty()) DestroyDividers(); return; }
+    // A maximized (or fullscreen) window in front of a screen: no dividers there, they'd float on top of it.
+    auto Alive = [](Node* n) {   // is there at least one shown, normal window below this node?
+        std::vector<Node*> st{n};
+        while (!st.empty()) {
+            Node* c = st.back();
+            st.pop_back();
+            if (c->leaf) { if (c->win && IsWindow(c->win) && IsWindowVisible(c->win) && !IsIconic(c->win) && !IsZoomed(c->win)) return true; }
+            else { st.push_back(c->a.get()); st.push_back(c->b.get()); }
+        }
+        return false;
+    };
+    std::set<HMONITOR> covered;
+    {
+        struct Cx { std::set<HMONITOR>* cov; std::set<HMONITOR> seen; const ETiler* self; } cx{&covered, {}, this};
+        EnumWindows([](HWND h, LPARAM lp) -> BOOL {   // top to bottom: the first real window per screen decides
+            auto* c = reinterpret_cast<Cx*>(lp);
+            if (!IsWindowVisible(h) || IsIconic(h)) return TRUE;
+            LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+            if (ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) return TRUE;   // dividers, bars, docks, popups
+            int cloaked = 0;
+            DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof cloaked);
+            if (cloaked) return TRUE;
+            wchar_t cls[64] = L"";
+            GetClassNameW(h, cls, 64);
+            if (!lstrcmpW(cls, L"Progman") || !lstrcmpW(cls, L"WorkerW")) return TRUE;
+            HMONITOR m = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+            if (c->seen.count(m)) return TRUE;
+            c->seen.insert(m);
+            bool full = IsZoomed(h);
+            if (!full) {
+                MONITORINFO mi{sizeof mi};
+                RECT r;
+                if (GetMonitorInfoW(m, &mi) && GetWindowRect(h, &r))
+                    full = r.left <= mi.rcMonitor.left && r.top <= mi.rcMonitor.top &&
+                           r.right >= mi.rcMonitor.right && r.bottom >= mi.rcMonitor.bottom;
+            }
+            if (full) c->cov->insert(m);
+            return TRUE;
+        }, (LPARAM)&cx);
+    }
     std::vector<Node*> splits;
     for (auto& [m, t] : trees_) {
+        if (covered.count(m)) continue;
         std::vector<Node*> stack;
         if (t.root) stack.push_back(t.root.get());
         while (!stack.empty()) {
             Node* c = stack.back();
             stack.pop_back();
             if (c->leaf) continue;
+            if (!Alive(c->a.get()) || !Alive(c->b.get())) continue;   // a divider needs a real window on both sides
             splits.push_back(c);
             stack.push_back(c->a.get());
             stack.push_back(c->b.get());
