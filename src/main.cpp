@@ -9,6 +9,7 @@
 #include "nowplaying.h"
 #include "flyouts.h"
 #include "mission.h"
+#include "stage.h"
 #include "systheme.h"
 #include "writing.h"
 #include "settings.h"
@@ -345,6 +346,10 @@ Settings LoadSettings() {
     s.startButton = GetPrivateProfileIntW(L"Start", L"Button", 0, p) == 1 ? 1 : 0;
     s.missionEnabled = GetPrivateProfileIntW(L"MissionControl", L"Enabled", 0, p) != 0;
     s.missionWinTab = GetPrivateProfileIntW(L"MissionControl", L"WinTab", 1, p) != 0;
+    s.stageEnabled = GetPrivateProfileIntW(L"StageManager", L"Enabled", 0, p) != 0;
+    s.stageMode = GetPrivateProfileIntW(L"StageManager", L"Mode", 0, p) == 1 ? 1 : 0;
+    s.stageHover = GetPrivateProfileIntW(L"StageManager", L"Hover", 0, p) == 1 ? 1 : 0;
+    s.stageMinimized = GetPrivateProfileIntW(L"StageManager", L"Minimized", 0, p) != 0;
     s.dockTrash = GetPrivateProfileIntW(L"Dock", L"Trash", 0, p) != 0;
     s.dockMinimize = GetPrivateProfileIntW(L"Dock", L"MinimizeToDock", 0, p) != 0;
     s.writingEnabled = GetPrivateProfileIntW(L"SkyWritingTools", L"Enabled", 0, p) != 0;
@@ -1120,7 +1125,7 @@ static void WatchForegroundMoves(HWND h) {
 static void CALLBACK ForegroundHook(HWINEVENTHOOK, DWORD, HWND h, LONG idObj, LONG, DWORD, DWORD) {
     if (idObj != OBJID_WINDOW) return;
     static HWND prevFg = nullptr;   // the window that just lost focus is still on screen: keep a fresh picture of it
-    if (g_app.settings.dockMinimize && prevFg && prevFg != h && IsWindow(prevFg) && !IsIconic(prevFg)) EnhancedSnapshotKick(prevFg, false);
+    if ((g_app.settings.dockMinimize || EnhancedSpacesAvailable() || g_app.settings.stageEnabled) && prevFg && prevFg != h && IsWindow(prevFg) && !IsIconic(prevFg)) EnhancedSnapshotKick(prevFg, false);
     prevFg = h;
     WatchForegroundMoves(h);
     bool winStart = IsWindowsStart(h);
@@ -1129,6 +1134,7 @@ static void CALLBACK ForegroundHook(HWINEVENTHOOK, DWORD, HWND h, LONG idObj, LO
     SetTimer(g_app.ctlWnd, kTimerFullscreen, 400, nullptr);   // and again once the game has settled
     for (auto& d : g_app.docks) d->OnForeground(h);
     Garden::OnForeground(h);
+    StageManager::OnForeground(h);
     g_app.UpdateForeground(h);
     if (g_app.fg.hwnd == h) StartMenus::NoteForeground(h, g_app.fg.path);   // VibeMenu learns what you use (only when it's chosen)
     // A window coming to the front must never cover the top bar (seen with tiling)
@@ -1362,6 +1368,7 @@ static LRESULT CALLBACK CtlProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 g_app.InvalidateAll();
             }
             EnhancedApply();
+            StageManager::Apply();
             DeskClockApply();
             WritingTools::ApplyHotkey();
             g_app.ApplyHotCorners();
@@ -1486,6 +1493,7 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int) {
                                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     g_app.tiler = std::make_unique<Tiler>();
     EnhancedApply();
+    StageManager::Apply();
     DeskClockApply();
     g_app.ApplyHotCorners();
     ApplyStartAlignment(g_app.settings.centerStart);
@@ -1516,6 +1524,7 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int) {
     NowPlaying::Shutdown();
     Garden::Shutdown();
     ApplyStartAlignment(false);   // give the user's own Start position back
+    StageManager::Shutdown();   // every window put away comes back
     EnhancedShutdown();
     if (g_app.tiler) {
         g_app.tiler->Stop();

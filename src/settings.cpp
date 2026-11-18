@@ -662,6 +662,9 @@ void SettingsWindow::BuildPage(SettingsPage pg) {
                    {TR(L"Stablede skjermer", L"Stacked screens"), TR(L"Skjerm med tall", L"Screen with number")},
                    [] { return GetPrivateProfileIntW(L"Tiling", L"SpacesIcon", 1, IniPathOf().c_str()) == 2 ? 1 : 0; },
                    [this](int v) { IniWrite(L"Tiling", L"SpacesIcon", v == 1 ? 2 : 1); ScheduleApply(); });
+            toggle(TR(L"Bytt arbeidsområde på alle skjermer", L"Switch workspace on all screens"), TR(L"Når du går til et arbeidsområde, går alle skjermene dit samtidig. Av: hver skjerm bytter for seg.", L"Going to a workspace takes every screen there together. Off: each screen switches on its own."),
+                   [] { return GetPrivateProfileIntW(L"Tiling", L"SpacesSync", 0, IniPathOf().c_str()) != 0; },
+                   [](bool v) { IniWrite(L"Tiling", L"SpacesSync", v ? 1 : 0); TilingApply(); });
             toggle(TR(L"Animasjon", L"Animation"), TR(L"Vinduene glir til ny plass (ca. 0,14 sekunder) i stedet for å hoppe.", L"Windows glide to their new place (about 0.14 s) instead of jumping."),
                    [] { return GetPrivateProfileIntW(L"Tiling", L"Animate", 1, IniPathOf().c_str()) != 0; },
                    [](bool v) { IniWrite(L"Tiling", L"Animate", v ? 1 : 0); TilingApply(); });
@@ -934,6 +937,31 @@ void SettingsWindow::BuildPage(SettingsPage pg) {
         if (!s.missionEnabled) rows.back().enabled = false;
         button(TR(L"Prøv Mission Control", L"Try Mission Control"), L"", TR(L"Åpne", L"Open"), [] { MissionControl::Toggle(); });
         if (!s.missionEnabled) rows.back().enabled = false;
+        header(L"Stage Manager");
+        toggle(L"Stage Manager",
+               TR(L"Som på Mac: appen du jobber i blir på skjermen, de andre appene ligger som små bilder i en stripe til venstre. Klikk en gruppe for å hente den fram. Hver skjerm har sin egen. Aldri på en skjerm med spill. Tiling er av mens dette er på.",
+                  L"Like on a Mac: the app you work in stays on the screen, the other apps sit as little pictures in a strip on the left. Click a group to bring it forward. Every screen has its own. Never on a screen with a game. Tiling is off while this is on."),
+               [&s] { return s.stageEnabled; },
+               [this, &s](bool v) { s.stageEnabled = v; IniWrite(L"StageManager", L"Enabled", v ? 1 : 0); ScheduleApply(); Rebuild(); });
+        choice(TR(L"Stripa", L"The strip"),
+               TR(L"Vanlig viser stripa hele tiden (den gjemmer seg når et vindu dekker den). Skjult vises bare når musa går helt til venstre på skjermen.",
+                  L"Normal keeps the strip on show (it slides away when a window covers it). Hidden only shows it when the mouse goes to the very left edge of the screen."),
+               {TR(L"Vanlig (som på Mac)", L"Normal (like a Mac)"), TR(L"Skjult til musa går helt til venstre", L"Hidden until the mouse touches the left edge")},
+               [&s] { return s.stageMode; },
+               [this, &s](int v) { s.stageMode = v == 1 ? 1 : 0; IniWrite(L"StageManager", L"Mode", s.stageMode); ScheduleApply(); });
+        if (!s.stageEnabled) rows.back().enabled = false;
+        choice(TR(L"Kortet under musa", L"Card under the mouse"),
+               TR(L"Hvordan kortet du peker på vises i stripa.", L"How the card you point at looks in the strip."),
+               {TR(L"Dimmer de andre", L"Dim the others"), TR(L"Myk glød", L"Soft glow")},
+               [&s] { return s.stageHover; },
+               [this, &s](int v) { s.stageHover = v == 1 ? 1 : 0; IniWrite(L"StageManager", L"Hover", s.stageHover); ScheduleApply(); });
+        if (!s.stageEnabled) rows.back().enabled = false;
+        toggle(TR(L"Ta med minimerte vinduer", L"Include minimised windows"),
+               TR(L"Av (som på Mac): bare det Stage Manager selv legger bort er i stripa; det du minimerer ligger i docken. På: apper du allerede har minimert er også i stripa, og ett klikk henter dem fram.",
+                  L"Off (like a Mac): only what Stage Manager puts away is in the strip; what you minimise sits in the dock. On: apps you already minimised are in the strip too, and one click brings them back."),
+               [&s] { return s.stageMinimized; },
+               [this, &s](bool v) { s.stageMinimized = v; IniWrite(L"StageManager", L"Minimized", v ? 1 : 0); ScheduleApply(); });
+        if (!s.stageEnabled) rows.back().enabled = false;
         header(TR(L"Docken: papirkurv og stack", L"The dock: Recycle Bin and stack"));
         toggle(TR(L"Papirkurv i docken", L"Recycle Bin in the dock"),
                TR(L"Helt til høyre i docken, tom eller full. Dra filer dit for å slette dem, høyreklikk for å tømme (Windows spør først).",
