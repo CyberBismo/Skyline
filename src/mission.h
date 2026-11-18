@@ -26,6 +26,7 @@ public:
     void Layout(RECT area, float scale = 1);         // grid inside `area` (client pixels), keeping each window's shape; scale = dpi/96
     void Step(float t);                              // 0 = where the windows really are, 1 = in the grid
     void Release();                                  // unregister everything
+    void Remove(HWND h);                             // drop one window (it went to another workspace); call Layout + Step again
     void SetVisible(bool on);                        // hide them all (e.g. while an app grid is showing)
     int HitTest(POINT client) const;                 // item under the point, or -1
     const std::vector<Item>& Items() const { return items_; }

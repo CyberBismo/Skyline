@@ -28,9 +28,17 @@ void TilingSchedule(UINT ms);
 
 // For Mission Control: the four workspaces of a screen with their windows (positions 0..1 of the screen's work area).
 struct EnhancedSpaceWin { HWND h; float l, t, r, b; };
-struct EnhancedSpaceInfo { int n; bool current; std::vector<EnhancedSpaceWin> wins; };
+struct EnhancedSpaceInfo { int n; bool current; std::vector<EnhancedSpaceWin> wins; std::vector<EnhancedSpaceWin> mons = {}; };   // mons: where each screen sits (h = that screen's HMONITOR), only for the all-screens view
 std::vector<EnhancedSpaceInfo> EnhancedSpacesInfo(HMONITOR mon, SIZE* workAreaSize);
+std::vector<EnhancedSpaceInfo> EnhancedSpacesInfoAll(SIZE* totalSize);   // the same, but all screens side by side in one picture
+bool EnhancedIsTiled(HWND h);   // the window sits in the tiling of the workspace on show (not minimized / floating)
+bool EnhancedSpacesSync();   // "switch on all screens" is on
 void EnhancedSwitchSpace(HMONITOR mon, int n);
+void EnhancedSnapshotNow(HWND h);   // a fresh picture of one window right now (before it is put away); skipped if it answers slowly
+void EnhancedSnapshotRefresh(HMONITOR mon);   // fresh pictures of the windows on show on that screen (background)
+bool EnhancedMoveToSpaceOn(HWND h, int n, HMONITOR mon);   // the same, onto a given screen (the window may change screen)
+bool EnhancedMoveToSpace(HWND h, int n);   // any workspace to any other (also a hidden window out of another workspace); false if not possible
+bool EnhancedSendToSpace(HWND h, int n);   // move a (tiled) window of the current workspace to workspace n; false if not possible
 bool EnhancedAddSpace();   // one more workspace (up to 8); false when not possible
 bool EnhancedCanRemoveSpace();   // the last workspace is empty and not in use
 bool EnhancedRemoveSpace();      // remove it (down to 2 workspaces)

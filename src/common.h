@@ -144,6 +144,10 @@ struct Settings {
     bool missionEnabled = false;          // Mission Control (plugin)
     bool missionWinTab = true;            // … opens with Win+Tab instead of Windows' Task view         // Advanced: everything plain and cheap; the previous settings come back when it's off
     bool dockTrash = false;               // Recycle Bin in the dock (plugin)
+    bool stageEnabled = false;            // Stage Manager (plugin): the app in front stays, the others sit in a strip at the left
+    bool stageMinimized = false;          // Stage Manager: apps already minimised by hand are in the strip too (off = like a Mac)
+    int stageHover = 0;                   // Stage Manager: card under the mouse – 0 the others dim, 1 soft glow
+    int stageMode = 0;                    // 0 always shown (like a Mac), 1 hidden until the mouse touches the left edge
     bool dockMinimize = false;            // minimised windows sit in the dock as little live pictures, like on a Mac
     // SkyWritingTools (plugin, writing.cpp): select text, press the hotkey, an AI rewrites it
     bool writingEnabled = false;

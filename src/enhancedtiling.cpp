@@ -208,6 +208,9 @@ bool CaptureRaw(HWND h, Raw& out) {   // GDI only: safe on a worker thread
                     bool same = true;
                     for (auto p : out.px) if (p != out.px[0]) { same = false; break; }
                     if (same) ok = false;
+                    size_t dark = 0;   // almost all black = the app gave no real picture of itself while minimized
+                    for (auto p : out.px) if ((p & 0xFFFFFF) < 0x0A0A0A && ((p >> 8) & 0xFF) < 10 && ((p >> 16) & 0xFF) < 10 && (p & 0xFF) < 10) ++dark;
+                    if (dark * 100 > out.px.size() * 92) ok = false;
                 }
                 SelectObject(d2, old2);
             }
@@ -234,7 +237,9 @@ void KickCapture(std::vector<HWND> wins, bool force = false) {
                 return it != g_snap.when.end() && now - it->second < 12000;
             }), wins.end());
     }
-    if (wins.empty() || g_snap.busy.exchange(true)) return;
+    if (wins.empty()) return;
+    if (force) g_snap.busy = true;                  // asked for on purpose (overview opening): don't drop it because a lazy one runs
+    else if (g_snap.busy.exchange(true)) return;
     std::thread([wins]() {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         for (HWND h : wins) {
@@ -242,11 +247,30 @@ void KickCapture(std::vector<HWND> wins, bool force = false) {
             bool ok = CaptureRaw(h, r);
             if (!ok && IsIconic(h)) continue;   // minimized and nothing usable: leave the earlier picture alone
             std::lock_guard<std::mutex> lk(g_snap.mu);
+            if (IsIconic(h) && g_snap.raw.count(h)) { g_snap.when[h] = GetTickCount64(); continue; }   // the picture taken before it was minimized is the good one
             g_snap.when[h] = GetTickCount64();   // (also after a failure: don't try again at once)
             if (ok) g_snap.raw[h] = std::move(r);
         }
         g_snap.busy = false;
     }).detach();
+}
+
+// A fresh picture of a window that is about to be hidden (there is no later chance: a hidden window can't be drawn).
+// Only if the app answers at once and the old picture is more than 2.5 s old.
+void CaptureNow(HWND h) {
+    {
+        std::lock_guard<std::mutex> lk(g_snap.mu);
+        auto it = g_snap.when.find(h);
+        if (it != g_snap.when.end() && GetTickCount64() - it->second < 2500) return;
+    }
+    if (!IsWindowVisible(h) || IsIconic(h)) return;
+    DWORD_PTR res = 0;
+    if (!SendMessageTimeoutW(h, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 80, &res)) return;
+    Raw r;
+    bool ok = CaptureRaw(h, r);
+    std::lock_guard<std::mutex> lk(g_snap.mu);
+    g_snap.when[h] = GetTickCount64();
+    if (ok) g_snap.raw[h] = std::move(r);
 }
 
 ComPtr<IWICBitmapSource> RawToWic(HWND h) {
@@ -328,6 +352,151 @@ private:
     void RebuildDocks();
 public:
     void ToggleOverview(HMONITOR mon);
+    void RefreshSnapshots(HMONITOR mon) {   // Mission Control opens: new pictures of the windows on show (in the background)
+        std::vector<HWND> ws;
+        for (auto& [m, tr] : trees_) {   // everything tiled on show (every screen: the cards can show them all)
+            std::vector<Node*> lv;
+            Leaves(tr.root.get(), lv);
+            for (Node* l : lv) ws.push_back(l->win);
+        }
+        // ...and the rest: floating and minimized windows, which have never been in a tiling (no picture until now)
+        struct Cx { ETiler* self; std::set<HWND> have; std::vector<HWND>* out; } cx{this, {ws.begin(), ws.end()}, &ws};
+        EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+            auto* c = reinterpret_cast<Cx*>(lp);
+            if (c->out->size() >= 30 || c->have.count(h) || !IsWindowVisible(h) || Cloaked(h) || c->self->hidden_.count(h)) return TRUE;
+            LONG ex = GetWindowLongW(h, GWL_EXSTYLE);
+            if (((ex & WS_EX_TOOLWINDOW) && !(ex & WS_EX_APPWINDOW)) || (ex & WS_EX_NOACTIVATE)) return TRUE;
+            if (GetWindow(h, GW_OWNER) && !(ex & WS_EX_APPWINDOW)) return TRUE;
+            DWORD pid = 0;
+            GetWindowThreadProcessId(h, &pid);
+            if (pid == GetCurrentProcessId()) return TRUE;
+            wchar_t t[8] = {};
+            if (!GetWindowTextW(h, t, 8)) return TRUE;
+            c->out->push_back(h);
+            return TRUE;
+        }, (LPARAM)&cx);
+        (void)mon;
+        KickCapture(ws, true);
+    }
+    // Like MoveToSpace, but onto a given screen: the window may leave the screen it is on (tiled in, or parked, there).
+    bool MoveToSpaceOn(HWND h, int n, HMONITOR tmon) {
+        if (!tmon || n < 1 || n > kSpaces || !IsWindow(h)) return MoveToSpace(h, n);
+        HMONITOR src = nullptr;
+        Node* leaf = nullptr;
+        Tree* st = nullptr;
+        if (InTree(h, &src, &leaf)) st = &trees_[src];
+        else {
+            for (auto& [k, t] : parked_)
+                if (t.root && (leaf = FindLeaf(t.root.get(), h))) { src = k.first; st = &t; break; }
+        }
+        if (!st) {   // minimized / floating
+            DWORD pid = 0;
+            GetWindowThreadProcessId(h, &pid);
+            if (pid == GetCurrentProcessId() || hidden_.count(h) || GetAncestor(h, GA_ROOT) != h) return false;
+            RECT r{};
+            if (IsIconic(h)) { WINDOWPLACEMENT wp{sizeof wp}; GetWindowPlacement(h, &wp); r = wp.rcNormalPosition; }
+            else GetWindowRect(h, &r);
+            src = MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST);
+        }
+        if (src == tmon) return MoveToSpace(h, n);
+        bool wasHidden = hidden_.count(h) != 0, needsRestore = IsIconic(h) || IsZoomed(h);
+        if (!wasHidden) CaptureNow(h);   // (a hidden one can't be drawn any more)
+        if (st && leaf) RemoveLeaf(*st, leaf);   // out of where it was
+        floating_.erase(h);
+        placed_.erase(h);
+        targets_.erase(h);
+        anims_.erase(h);
+        bool hung = IsHungAppWindow(h) != FALSE;
+        if (needsRestore) { if (hung) ShowWindowAsync(h, SW_RESTORE); else ShowWindow(h, SW_RESTORE); }   // (at once: the move below must see the restored window)
+        if (n == CurSpace(tmon)) {   // onto what is on show there: put it on that screen, and Retile tiles it in
+            if (wasHidden) { hidden_.erase(h); pendingShow_[h] = GetTickCount64(); ShowWindowAsync(h, SW_SHOWNA); }
+            RECT wa = WorkArea(tmon);
+            int w = (wa.right - wa.left) / 2, hh = (wa.bottom - wa.top) / 2;
+            // at once (not async): the next Retile must already find the window on the new screen, or it puts it back in the old one
+            SetWindowPos(h, nullptr, wa.left + w / 2, wa.top + hh / 2, w, hh, SWP_NOZORDER | SWP_NOACTIVATE | (hung ? SWP_ASYNCWINDOWPOS : 0));
+        } else {
+            ParkWindow(h, tmon, n);
+        }
+        PersistHidden();
+        RebuildDocks();
+        g_app.InvalidateAll();
+        Schedule(120);
+        return true;
+    }
+    bool SendWindowToSpace(HWND h, int n) {   // for Mission Control: false if the window isn't tiled here or already is there
+        HMONITOR mon = nullptr;
+        if (!InTree(h, &mon) || n < 1 || n > kSpaces || n == CurSpace(mon)) return false;
+        SendToSpace(h, n);
+        return true;
+    }
+    // Any workspace to any other: from the current one, or out of a parked one (hidden window) to another or to the one on show.
+    bool MoveToSpace(HWND h, int n) {
+        if (n < 1 || n > kSpaces || !IsWindow(h)) return false;
+        if (SendWindowToSpace(h, n)) return true;
+        auto lay = [&](HMONITOR mon, Tree& t) {   // parked trees keep their last layout: redo it so the little pictures are right
+            if (!t.root) return;
+            int g = GapFor(mon);
+            RECT wa = WorkArea(mon);
+            RECT a{wa.left + g, wa.top + g, wa.right - g, wa.bottom - g};
+            LayoutNode(t.root.get(), a, g);
+        };
+        for (auto it = parked_.begin(); it != parked_.end(); ++it) {
+            Node* leaf = it->second.root ? FindLeaf(it->second.root.get(), h) : nullptr;
+            if (!leaf) continue;
+            HMONITOR mon = it->first.first;
+            if (it->first.second == n) return false;
+            RemoveLeaf(it->second, leaf);
+            if (it->second.root) lay(mon, it->second);
+            else parked_.erase(it);
+            if (n == CurSpace(mon)) {   // onto the workspace on show: the window comes back and Retile tiles it in
+                hidden_.erase(h);
+                pendingShow_[h] = GetTickCount64();
+                ShowWindowAsync(h, SW_SHOWNA);
+                placed_.erase(h);
+            } else {
+                ParkWindow(h, mon, n);
+                auto pk = parked_.find({mon, n});
+                if (pk != parked_.end()) lay(mon, pk->second);
+            }
+            PersistHidden();
+            RebuildDocks();
+            g_app.InvalidateAll();
+            Schedule(30);
+            return true;
+        }
+        // Not tiled anywhere: a minimized window (or one that floats). It is restored in the workspace it is sent to and tiled in there.
+        if (InTree(h)) return false;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(h, &pid);
+        if (pid == GetCurrentProcessId() || hidden_.count(h) || GetAncestor(h, GA_ROOT) != h) return false;
+        bool iconic = IsIconic(h) != FALSE, wasFloat = floating_.count(h) != 0;
+        RECT r{};
+        if (iconic) { WINDOWPLACEMENT wp{sizeof wp}; GetWindowPlacement(h, &wp); r = wp.rcNormalPosition; }
+        else GetWindowRect(h, &r);
+        HMONITOR mon = MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST);
+        floating_.erase(h);   // it was moved on purpose: it takes part in the tiling again
+        if (n == CurSpace(mon)) {   // the workspace on show: restored, and Retile tiles it in
+            if (!iconic && !wasFloat) return false;
+            if (iconic) ShowWindowAsync(h, SW_RESTORE);   // (async: a busy app must not freeze Skyline)
+            placed_.erase(h);
+            Schedule(30);
+            g_app.InvalidateAll();
+            return true;
+        }
+        if (iconic) ShowWindowAsync(h, SW_RESTORE);   // restored first, then hidden: it comes back normal and is tiled
+        CaptureNow(h);
+        ParkWindow(h, mon, n);
+        auto pk = parked_.find({mon, n});
+        if (pk != parked_.end() && pk->second.root) {
+            int g = GapFor(mon);
+            RECT wa = WorkArea(mon);
+            RECT a{wa.left + g, wa.top + g, wa.right - g, wa.bottom - g};
+            LayoutNode(pk->second.root.get(), a, g);
+        }
+        Schedule(30);
+        g_app.InvalidateAll();
+        return true;
+    }
     bool LastSpaceFree() const {
         for (auto& [m, c] : cur_) if (c == kSpaces) return false;
         for (auto& [k, t] : parked_) if (k.second == kSpaces && t.root) return false;
@@ -336,7 +505,46 @@ public:
     void DropLastSpace();
     void ReRegisterHotkeys() { if (hotkeys_) { UnregisterHotkeys(); RegisterHotkeys(); } }
     std::vector<EnhancedSpaceInfo> Info(HMONITOR mon, SIZE* waSize);
-    void GoToSpace(HMONITOR mon, int n) { SwitchSpace(mon, n); }
+    bool SpacesSync() const { return spacesSync_; }
+    bool IsTiled(HWND h) { return InTree(h); }
+    std::vector<EnhancedSpaceInfo> InfoAll(SIZE* total) {   // every screen, laid out as they sit on the desk (like the Spaces bar on a Mac)
+        std::vector<HMONITOR> mons;
+        EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR m, HDC, LPRECT, LPARAM lp) -> BOOL { ((std::vector<HMONITOR>*)lp)->push_back(m); return TRUE; }, (LPARAM)&mons);
+        std::vector<EnhancedSpaceInfo> out;
+        if (mons.empty()) return out;
+        std::vector<RECT> was;
+        RECT u{LONG_MAX, LONG_MAX, LONG_MIN, LONG_MIN};
+        for (HMONITOR m : mons) {
+            RECT w = WorkArea(m);
+            was.push_back(w);
+            u.left = std::min(u.left, w.left); u.top = std::min(u.top, w.top);
+            u.right = std::max(u.right, w.right); u.bottom = std::max(u.bottom, w.bottom);
+        }
+        float UW = (float)std::max<LONG>(1, u.right - u.left), UH = (float)std::max<LONG>(1, u.bottom - u.top);
+        if (total) *total = {(LONG)UW, (LONG)UH};
+        for (size_t i = 0; i < mons.size(); ++i) {
+            SIZE s{};
+            auto inf = Info(mons[i], &s);
+            float W = (float)std::max<LONG>(1, was[i].right - was[i].left), H = (float)std::max<LONG>(1, was[i].bottom - was[i].top);
+            auto mapX = [&](float f) { return (was[i].left + f * W - u.left) / UW; };
+            auto mapY = [&](float f) { return (was[i].top + f * H - u.top) / UH; };
+            if (out.empty()) { out.resize(inf.size()); for (size_t k = 0; k < inf.size(); ++k) { out[k].n = inf[k].n; out[k].current = false; } }
+            for (size_t k = 0; k < inf.size() && k < out.size(); ++k) {
+                if (i == 0) out[k].current = inf[k].current;
+                out[k].mons.push_back({(HWND)mons[i], mapX(0), mapY(0), mapX(1), mapY(1)});   // (h holds the screen's HMONITOR here)
+                for (auto& w : inf[k].wins) out[k].wins.push_back({w.h, mapX(w.l), mapY(w.t), mapX(w.r), mapY(w.b)});
+            }
+        }
+        return out;
+    }
+    // One workspace: that screen only (as always). With "switch on all screens" every screen goes to workspace n together.
+    void GoToSpace(HMONITOR mon, int n) {
+        SwitchSpace(mon, n);   // the screen you used first: it gets the focus
+        if (!spacesSync_) return;
+        std::vector<HMONITOR> mons;
+        EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR m, HDC, LPRECT, LPARAM lp) -> BOOL { ((std::vector<HMONITOR>*)lp)->push_back(m); return TRUE; }, (LPARAM)&mons);
+        for (HMONITOR m : mons) if (m != mon) SwitchSpace(m, n);
+    }
     static LRESULT CALLBACK OverviewProc(HWND w, UINT m, WPARAM wp, LPARAM lp);
     int CurrentSpace(HMONITOR m) const { return CurSpace(m); }
     bool IsHiddenWin(HWND h) const { return hidden_.count(h) != 0; }
@@ -377,7 +585,7 @@ private:
     int spacesHover_ = -1;
     RECT spacesWa_{};                 // work area of that screen (what the little screens are scaled from)
     int cardW_ = 0, cardH_ = 0, bodyW_ = 0, bodyH_ = 0;
-    bool useDividers_ = true, useSnap_ = true, animate_ = true, focusFollows_ = false, noAnim_ = false;
+    bool useDividers_ = true, useSnap_ = true, animate_ = true, focusFollows_ = false, noAnim_ = false, spacesSync_ = false;
     struct Anim { RECT from, to; int l, t, r, b; ULONGLONG t0; };
     std::map<HWND, Anim> anims_;
     POINT lastCur_{-1, -1};
@@ -445,6 +653,7 @@ void ETiler::ApplySettings() {
     useSnap_ = GetPrivateProfileIntW(L"Tiling", L"Snap", 1, g_app.settings.path.c_str()) != 0;
     animate_ = GetPrivateProfileIntW(L"Tiling", L"Animate", 1, g_app.settings.path.c_str()) != 0;
     focusFollows_ = GetPrivateProfileIntW(L"Tiling", L"FocusFollowsMouse", 0, g_app.settings.path.c_str()) != 0;
+    spacesSync_ = GetPrivateProfileIntW(L"Tiling", L"SpacesSync", 0, g_app.settings.path.c_str()) != 0;
     if (!animate_) { anims_.clear(); if (g_app.ctlWnd) KillTimer(g_app.ctlWnd, kTimerAnim); }
     if (g_app.ctlWnd) {
         if (want && focusFollows_) SetTimer(g_app.ctlWnd, kTimerFocus, 120, nullptr);
@@ -926,6 +1135,10 @@ void ETiler::SwitchSpace(HMONITOR mon, int n) {
     if (it != trees_.end() && it->second.root) {
         std::vector<Node*> lv;
         Leaves(it->second.root.get(), lv);
+        {   // the last chance for a fresh picture of each window (for the workspace cards and previews)
+            ULONGLONG t0 = GetTickCount64();
+            for (Node* l : lv) { if (GetTickCount64() - t0 > 160) break; CaptureNow(l->win); }
+        }
         for (Node* l : lv) {
             hidden_.insert(l->win);
             ShowWindowAsync(l->win, SW_HIDE);
@@ -999,6 +1212,7 @@ void ETiler::SendToSpace(HWND h, int n) {
     HMONITOR mon = nullptr;
     Node* leaf = nullptr;
     if (!InTree(h, &mon, &leaf) || n < 1 || n > kSpaces || n == CurSpace(mon)) return;
+    CaptureNow(h);
     RemoveLeaf(trees_[mon], leaf);
     ParkWindow(h, mon, n);
     // another window of this screen gets the focus
@@ -1078,7 +1292,7 @@ bool ETiler::Reveal(HWND h) {
         if (!FindLeaf(tree.root.get(), h)) continue;
         HMONITOR mon = key.first;
         int n = key.second;
-        SwitchSpace(mon, n);
+        GoToSpace(mon, n);
         focusAfter_ = h;
         return true;
     }
@@ -1349,12 +1563,12 @@ LRESULT CALLBACK ETiler::OverviewProc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         int i = t->CardAt(lp);
         HMONITOR mon = t->spacesMon_;
         t->HideOverview();
-        if (i >= 0) t->SwitchSpace(mon, i + 1);
+        if (i >= 0) t->GoToSpace(mon, i + 1);
         return 0;
     }
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) t->HideOverview();
-        else if (wp >= '1' && wp <= '0' + kSpaces) { HMONITOR mon = t->spacesMon_; t->HideOverview(); t->SwitchSpace(mon, (int)(wp - '0')); }
+        else if (wp >= '1' && wp <= '0' + kSpaces) { HMONITOR mon = t->spacesMon_; t->HideOverview(); t->GoToSpace(mon, (int)(wp - '0')); }
         return 0;
     case WM_ACTIVATE:
         if (LOWORD(wp) == WA_INACTIVE) t->HideOverview();
@@ -1373,10 +1587,40 @@ std::vector<EnhancedSpaceInfo> ETiler::Info(HMONITOR mon, SIZE* waSize) {
         Tree* tree = nullptr;
         if (si.current) { auto t = trees_.find(mon); if (t != trees_.end()) tree = &t->second; }
         else { auto p = parked_.find({mon, n}); if (p != parked_.end()) tree = &p->second; }
+        if (tree && tree->root && !si.current) {   // a parked workspace has no up-to-date layout (a window just sent there has none at all): work it out now
+            int g = GapFor(mon);
+            RECT a{wa.left + g, wa.top + g, wa.right - g, wa.bottom - g};
+            LayoutNode(tree->root.get(), a, g);
+        }
         std::vector<Node*> lv;
         if (tree && tree->root) Leaves(tree->root.get(), lv);
         for (Node* l : lv)
             si.wins.push_back({l->win, (l->rect.left - wa.left) / W, (l->rect.top - wa.top) / H, (l->rect.right - wa.left) / W, (l->rect.bottom - wa.top) / H});
+        if (si.current) {   // windows that float (not tiled) are on show too: the card must not say "empty" while they are there
+            struct Cx { ETiler* self; HMONITOR mon; std::set<HWND> have; std::vector<HWND> found; } cx{this, mon, {}, {}};
+            for (Node* l : lv) cx.have.insert(l->win);
+            EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+                auto* c = reinterpret_cast<Cx*>(lp);
+                if (c->have.count(h) || !IsWindowVisible(h) || IsIconic(h) || Cloaked(h) || c->self->hidden_.count(h)) return TRUE;
+                LONG ex = GetWindowLongW(h, GWL_EXSTYLE);
+                if (((ex & WS_EX_TOOLWINDOW) && !(ex & WS_EX_APPWINDOW)) || (ex & WS_EX_NOACTIVATE)) return TRUE;
+                if (GetWindow(h, GW_OWNER) && !(ex & WS_EX_APPWINDOW)) return TRUE;
+                DWORD pid = 0;
+                GetWindowThreadProcessId(h, &pid);
+                if (pid == GetCurrentProcessId() || MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) != c->mon) return TRUE;
+                wchar_t t[8] = {};
+                if (!GetWindowTextW(h, t, 8)) return TRUE;   // no title: not a real app window
+                c->found.push_back(h);
+                return TRUE;
+            }, (LPARAM)&cx);
+            for (auto it = cx.found.rbegin(); it != cx.found.rend(); ++it) {   // back to front, so the top one is painted last
+                RECT f = FrameBounds(*it);
+                float l = std::clamp((f.left - wa.left) / W, 0.0f, 1.0f), t = std::clamp((f.top - wa.top) / H, 0.0f, 1.0f);
+                float r = std::clamp((f.right - wa.left) / W, 0.0f, 1.0f), b = std::clamp((f.bottom - wa.top) / H, 0.0f, 1.0f);
+                if (r - l < 0.03f || b - t < 0.03f) continue;
+                si.wins.push_back({*it, l, t, r, b});
+            }
+        }
         out.push_back(std::move(si));
     }
     return out;
@@ -1879,7 +2123,7 @@ bool ETiler::OnHotkey(int id) {
     case HkSpace1: case HkSpace2: case HkSpace3: case HkSpace4: case HkSpace5: case HkSpace6: case HkSpace7: case HkSpace8: {
         POINT c;
         GetCursorPos(&c);
-        SwitchSpace(MonitorFromPoint(c, MONITOR_DEFAULTTONEAREST), id - HkSpace1 + 1);
+        GoToSpace(MonitorFromPoint(c, MONITOR_DEFAULTTONEAREST), id - HkSpace1 + 1);
         break;
     }
     case HkSend1: case HkSend2: case HkSend3: case HkSend4: case HkSend5: case HkSend6: case HkSend7: case HkSend8:
@@ -1894,6 +2138,12 @@ bool ETiler::OnHotkey(int id) {
 // ---------------------------------------------------------------------------
 // Public functions (see enhancedtiling.h)
 void EnhancedApply() {
+    // Stage Manager and tiling both lay windows out: while Stage Manager is on, tiling is off (the settings are kept)
+    struct StageGate {
+        bool saved; bool on;
+        StageGate() : saved(g_app.settings.tilingEnabled), on(g_app.settings.stageEnabled) { if (on) g_app.settings.tilingEnabled = false; }
+        ~StageGate() { if (on) g_app.settings.tilingEnabled = saved; }
+    } gate;
     if (!g_et) g_et = std::make_unique<ETiler>();
     auto plain = [] {
         if (!g_app.tiler) return;
@@ -1927,10 +2177,18 @@ bool EnhancedSpacesAvailable() { return g_app.settings.tilingEnabled && g_app.se
 int EnhancedCurrentSpace(HMONITOR mon) { return g_et ? g_et->CurrentSpace(mon) : 1; }
 void EnhancedSpacesToggle(HMONITOR mon) { if (g_et) g_et->ToggleOverview(mon); }
 std::vector<EnhancedSpaceInfo> EnhancedSpacesInfo(HMONITOR mon, SIZE* sz) { return (g_et && g_et->Running()) ? g_et->Info(mon, sz) : std::vector<EnhancedSpaceInfo>(); }
+std::vector<EnhancedSpaceInfo> EnhancedSpacesInfoAll(SIZE* sz) { return (g_et && g_et->Running()) ? g_et->InfoAll(sz) : std::vector<EnhancedSpaceInfo>(); }
+bool EnhancedIsTiled(HWND h) { return g_et && g_et->Running() && g_et->IsTiled(h); }
+bool EnhancedSpacesSync() { return g_et && g_et->Running() && g_et->SpacesSync(); }
 void EnhancedSwitchSpace(HMONITOR mon, int n) { if (g_et && g_et->Running()) g_et->GoToSpace(mon, n); }
+void EnhancedSnapshotRefresh(HMONITOR mon) { if (g_et && g_et->Running()) g_et->RefreshSnapshots(mon); }
+bool EnhancedSendToSpace(HWND h, int n) { return g_et && g_et->Running() && g_et->SendWindowToSpace(h, n); }
+bool EnhancedMoveToSpaceOn(HWND h, int n, HMONITOR mon) { return g_et && g_et->Running() && g_et->MoveToSpaceOn(h, n, mon); }
+bool EnhancedMoveToSpace(HWND h, int n) { return g_et && g_et->Running() && g_et->MoveToSpace(h, n); }
 bool EnhancedReveal(HWND h) { return g_et && g_et->Reveal(h); }
 ComPtr<IWICBitmapSource> EnhancedSnapshot(HWND h) { return RawToWic(h); }   // (works without Enhanced Tiling too)
 void EnhancedSnapshotKick(HWND h, bool force) { if (h) KickCapture({h}, force); }
+void EnhancedSnapshotNow(HWND h) { if (h) CaptureNow(h); }
 void EnhancedTimer() { if (g_et) g_et->OnTimer(); }
 void EnhancedAnimTimer() { if (g_et) g_et->OnAnimTimer(); }
 void EnhancedFocusTimer() { if (g_et) g_et->OnFocusTimer(); }
