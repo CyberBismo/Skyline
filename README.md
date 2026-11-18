@@ -1,4 +1,4 @@
-# Skyline for Windows 11 2.38 – full backup (9. oktober 2026)
+# Skyline for Windows 11 2.39 – full backup (16. november 2026)
 
 Native topplinje, dock, tray-vert og automatisk tiling for Windows 11.
 C++20, Win32, Direct2D/DirectWrite. Ingen webview, ingen .NET, ingen eksterne biblioteker.

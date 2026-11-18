@@ -1,6 +1,7 @@
 // Skyline — Copyright © 2026 Yen-Zen & Cyber. All rights reserved. See LICENSE.txt.
 // Skyline tiling — automatic window layout, per monitor.
 #include "tiling.h"
+#include "version.h"
 #include "app.h"
 #include "bar.h"
 #include "dock.h"
@@ -12,7 +13,7 @@ constexpr UINT_PTR kTimerTile = 0x7110;
 
 enum Hotkey {
     HkToggle = 0x5100, HkFocusL, HkFocusR, HkFocusU, HkFocusD, HkSwapL, HkSwapR, HkSwapU, HkSwapD,
-    HkFloat, HkLayout, HkRetile
+    HkFloat, HkLayout, HkRetile, HkDebug
 };
 
 bool Cloaked(HWND h) {
@@ -63,6 +64,10 @@ void Tiler::Stop() {
     for (auto& [pid, h] : locHooks_) UnhookWinEvent(h);
     locHooks_.clear();
     tries_.clear();
+    seen_.clear();
+    ratios_.clear();
+    memIndex_.clear();
+    splits_.clear();
     KillTimer(g_app.ctlWnd, kTimerTile);
     order_.clear();
     placed_.clear();
@@ -93,6 +98,7 @@ void Tiler::OnTimer() {
 void CALLBACK Tiler::OnEvent(HWINEVENTHOOK, DWORD ev, HWND h, LONG obj, LONG child, DWORD, DWORD) {
     Tiler* t = g_app.tiler.get();
     if (!t || !t->running_ || obj != OBJID_WINDOW || child != CHILDID_SELF || !h) return;
+    if (GameMode()) { t->pendingRetile_ = true; return; }
     bool automatic = g_app.settings.tilingMode != 2;
 
     switch (ev) {
@@ -103,7 +109,21 @@ void CALLBACK Tiler::OnEvent(HWINEVENTHOOK, DWORD ev, HWND h, LONG obj, LONG chi
         g_moving = nullptr;
         POINT pt;
         GetCursorPos(&pt);
-        if (std::find(t->order_.begin(), t->order_.end(), h) != t->order_.end()) t->SwapAt(h, pt);
+        if (std::find(t->order_.begin(), t->order_.end(), h) != t->order_.end()) {
+            // Dragged an edge (the size changed): the neighbours give way. Dragged the whole window: it swaps places.
+            RECT fb = FrameBounds(h);
+            auto tg = t->targets_.find(h);
+            bool resized = tg != t->targets_.end() &&
+                           (std::abs((fb.right - fb.left) - (tg->second.right - tg->second.left)) > 6 ||
+                            std::abs((fb.bottom - fb.top) - (tg->second.bottom - tg->second.top)) > 6);
+            if (resized) {
+                t->ApplyResize(h, fb);
+                t->placed_.clear();
+                t->Schedule(30);
+                return;
+            }
+            t->SwapAt(h, pt);
+        }
         if (automatic) t->Schedule(30);
         return;
     }
@@ -182,11 +202,17 @@ bool Tiler::Manageable(HWND h) const {
 RECT Tiler::WorkArea(HMONITOR mon) const {
     MONITORINFO mi{sizeof mi};
     GetMonitorInfoW(mon, &mi);
-    RECT a = mi.rcWork;   // normally already excludes the Skyline top bar …
-    // … but don't count on it: the strip the top bar takes is always kept free, so title bars
-    // (with minimize/maximize/close) never end up under it (seen with the classic style).
+    RECT a = mi.rcWork;
+    // The top comes from our own bar only. Windows' work area can still hold an old reservation at the top (left from
+    // when the bar was not auto-hiding, or from another app); with auto-hide on that made tiled windows start far
+    // down the screen with an empty strip above them.
+    a.top = mi.rcMonitor.top;
+    // The strip the top bar takes is kept free, so title bars (with minimize/maximize/close) never end up under it.
     for (auto& b : g_app.bars)
-        if (b->Monitor() == mon) a.top = std::max<LONG>(a.top, b->ReservedBottom());
+        if (b->Monitor() == mon) {
+            int reserved = b->ReservedBottom();   // a screen y; 0 = nothing reserved (auto-hide). Never compare with 0 itself:
+            if (reserved != 0) a.top = std::max<LONG>(a.top, reserved);   // a screen above the main one has a negative top
+        }
     Dock* dock = g_app.DockOn(mon);
     if (g_app.settings.tilingDockSpace && dock) {
         int top = dock->TopEdge(mon);
@@ -195,7 +221,7 @@ RECT Tiler::WorkArea(HMONITOR mon) const {
     return a;
 }
 
-std::vector<RECT> Tiler::Layout(int n, const RECT& area) const {
+std::vector<RECT> Tiler::Layout(int n, const RECT& area, Ratios* rat, std::vector<Split>* splits, const std::vector<HWND>* wins) const {
     std::vector<RECT> out;
     if (n <= 0) return out;
     UINT dpi = 96;
@@ -208,36 +234,53 @@ std::vector<RECT> Tiler::Layout(int n, const RECT& area) const {
     int h2 = g / 2;
     RECT r{area.left + g, area.top + g, area.right - g, area.bottom - g};
 
-    auto splitH = [&](RECT& src, float frac) {   // left part out, src becomes right
-        int mid = src.left + (int)((src.right - src.left) * frac);
+    // Fractions the user has dragged (0 = the default). They start over when the layout or the number of windows changes.
+    int layoutNow = g_app.settings.tilingLayout;
+    std::vector<float> none;
+    std::vector<float>& fr = rat ? rat->fr : none;
+    std::vector<HWND> key;
+    if (wins) { key = *wins; std::sort(key.begin(), key.end()); }
+    if (rat && (rat->layout != layoutNow || rat->key != key || (int)fr.size() != std::max(0, n - 1))) {
+        // other windows or another layout: the sizes of the same group of windows (a window minimized and back) come back
+        rat->layout = layoutNow; rat->key = key;
+        fr.assign(std::max(0, n - 1), 0.0f);
+        auto old = rat->saved.find({layoutNow, key});
+        if (wins && old != rat->saved.end() && (int)old->second.size() == (int)fr.size()) fr = old->second;
+    }
+    auto frac = [&](int k, float dflt) { return (k >= 0 && k < (int)fr.size() && fr[k] > 0.05f) ? std::clamp(fr[k], 0.1f, 0.9f) : dflt; };
+
+    auto splitH = [&](RECT& src, int k, float dflt) {   // left part out, src becomes right
+        int mid = src.left + (int)((src.right - src.left) * frac(k, dflt));
         RECT a{src.left, src.top, mid - h2, src.bottom};
+        if (splits) splits->push_back({k, true, src, mid, mid - h2, mid + (g - h2)});
         src.left = mid + (g - h2);
         return a;
     };
-    auto splitV = [&](RECT& src, float frac) {   // top part out, src becomes bottom
-        int mid = src.top + (int)((src.bottom - src.top) * frac);
+    auto splitV = [&](RECT& src, int k, float dflt) {   // top part out, src becomes bottom
+        int mid = src.top + (int)((src.bottom - src.top) * frac(k, dflt));
         RECT a{src.left, src.top, src.right, mid - h2};
+        if (splits) splits->push_back({k, false, src, mid, mid - h2, mid + (g - h2)});
         src.top = mid + (g - h2);
         return a;
     };
 
-    switch (g_app.settings.tilingLayout) {
+    switch (layoutNow) {
     case 0: {   // BSP / dwindle: each new window splits the last one along its long side
         RECT cur = r;
         for (int i = 0; i < n; ++i) {
             if (i == n - 1) { out.push_back(cur); break; }
             bool wide = (cur.right - cur.left) >= (cur.bottom - cur.top);
-            out.push_back(wide ? splitH(cur, 0.5f) : splitV(cur, 0.5f));
+            out.push_back(wide ? splitH(cur, i, 0.5f) : splitV(cur, i, 0.5f));
         }
         break;
     }
     case 1: {   // Master: one big window left, the rest stacked on the right
         if (n == 1) { out.push_back(r); break; }
         RECT rest = r;
-        out.push_back(splitH(rest, 0.55f));
+        out.push_back(splitH(rest, 0, 0.55f));
         for (int i = 1; i < n; ++i) {
             if (i == n - 1) { out.push_back(rest); break; }
-            out.push_back(splitV(rest, 1.0f / (n - i)));
+            out.push_back(splitV(rest, i, 1.0f / (n - i)));
         }
         break;
     }
@@ -245,7 +288,7 @@ std::vector<RECT> Tiler::Layout(int n, const RECT& area) const {
         RECT rest = r;
         for (int i = 0; i < n; ++i) {
             if (i == n - 1) { out.push_back(rest); break; }
-            out.push_back(splitH(rest, 1.0f / (n - i)));
+            out.push_back(splitH(rest, i, 1.0f / (n - i)));
         }
         break;
     }
@@ -253,7 +296,44 @@ std::vector<RECT> Tiler::Layout(int n, const RECT& area) const {
         for (int i = 0; i < n; ++i) out.push_back(r);
         break;
     }
+    if (rat && wins) {
+        rat->saved[{layoutNow, key}] = fr;
+        if (rat->saved.size() > 24) rat->saved.erase(rat->saved.begin());
+    }
     return out;
+}
+
+// The user dragged an edge of a tiled window: find the divider that edge sits on and move it there.
+bool Tiler::ApplyResize(HWND h, const RECT& now) {
+    auto tg = targets_.find(h);
+    if (tg == targets_.end()) return false;
+    const RECT& T = tg->second;
+    HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+    auto sp = splits_.find(mon);
+    auto rt = ratios_.find(mon);
+    if (sp == splits_.end() || rt == ratios_.end()) return false;
+    auto isAt = [](LONG a, LONG b) { return std::labs(a - b) <= 2; };
+    auto moved = [](LONG a, LONG b) { return std::labs(a - b) > 3; };
+    bool any = false;
+    for (const Split& s : sp->second) {
+        if (s.k < 0 || s.k >= (int)rt->second.fr.size()) continue;
+        if (T.left < s.parent.left - 2 || T.right > s.parent.right + 2 || T.top < s.parent.top - 2 || T.bottom > s.parent.bottom + 2) continue;
+        LONG newMid = 0;
+        bool hit = false;
+        if (s.horiz) {
+            if (isAt(T.right, s.firstEdge) && moved(now.right, T.right)) { newMid = now.right + (s.mid - s.firstEdge); hit = true; }
+            else if (isAt(T.left, s.secondEdge) && moved(now.left, T.left)) { newMid = now.left - (s.secondEdge - s.mid); hit = true; }
+        } else {
+            if (isAt(T.bottom, s.firstEdge) && moved(now.bottom, T.bottom)) { newMid = now.bottom + (s.mid - s.firstEdge); hit = true; }
+            else if (isAt(T.top, s.secondEdge) && moved(now.top, T.top)) { newMid = now.top - (s.secondEdge - s.mid); hit = true; }
+        }
+        if (!hit) continue;
+        LONG lo = s.horiz ? s.parent.left : s.parent.top, hi = s.horiz ? s.parent.right : s.parent.bottom;
+        if (hi <= lo) continue;
+        rt->second.fr[s.k] = std::clamp((float)(newMid - lo) / (float)(hi - lo), 0.1f, 0.9f);
+        any = true;
+    }
+    return any;
 }
 
 void Tiler::Place(HWND h, const RECT& target) {
@@ -266,6 +346,11 @@ void Tiler::Place(HWND h, const RECT& target) {
     // Already put in this slot: leave it. (Some apps refuse to get smaller than
     // their minimum size; re-placing them forever would make windows jitter.)
     RECT fb = FrameBounds(h);
+    {   // an app that moves or resizes itself (e.g. restoring its saved position a moment after opening) gets new tries
+        auto seen = seen_.find(h);
+        if (seen != seen_.end() && !Near(seen->second, fb)) tries_[h] = 0;
+        seen_[h] = fb;
+    }
     auto it = placed_.find(h);
     if (it != placed_.end() && Near(it->second, target)) {
         // Really there (or the app refuses after a couple of tries): leave it.
@@ -290,6 +375,7 @@ void Tiler::Place(HWND h, const RECT& target) {
 void Tiler::Retile() {
     if (g_moving && !IsWindow(g_moving)) g_moving = nullptr;   // closed mid-drag: its "move ended" never came
     if (!running_ || retiling_ || g_moving) return;
+    if (GameMode()) { pendingRetile_ = true; return; }   // a game in fullscreen: never move windows now (it would drop out of fullscreen)
     retiling_ = true;
 
     // Current tileable windows (z-order)
@@ -309,23 +395,34 @@ void Tiler::Retile() {
 
     // Keep existing order, drop vanished windows, append new ones (oldest first)
     std::vector<HWND> next;
-    for (HWND h : order_) if (std::find(now.begin(), now.end(), h) != now.end()) next.push_back(h);
+    for (size_t i = 0; i < order_.size(); ++i) {
+        HWND h = order_[i];
+        if (std::find(now.begin(), now.end(), h) != now.end()) next.push_back(h);
+        else if (IsWindow(h) && IsIconic(h)) memIndex_[h] = (int)i;   // minimized: it comes back to this place
+    }
     for (auto it = now.rbegin(); it != now.rend(); ++it)
-        if (std::find(next.begin(), next.end(), *it) == next.end()) next.push_back(*it);
+        if (std::find(next.begin(), next.end(), *it) == next.end()) {
+            auto mem = memIndex_.find(*it);
+            if (mem != memIndex_.end()) { next.insert(next.begin() + std::min<size_t>(mem->second, next.size()), *it); memIndex_.erase(mem); }
+            else next.push_back(*it);
+        }
     order_ = next;
+    for (auto it = memIndex_.begin(); it != memIndex_.end();) it = IsWindow(it->first) ? std::next(it) : memIndex_.erase(it);
 
     for (auto it = placed_.begin(); it != placed_.end();) it = IsWindow(it->first) ? std::next(it) : placed_.erase(it);
     for (auto it = floating_.begin(); it != floating_.end();) it = IsWindow(*it) ? std::next(it) : floating_.erase(it);
     for (auto it = known_.begin(); it != known_.end();) it = IsWindow(*it) ? std::next(it) : known_.erase(it);
     for (auto it = exeCache_.begin(); it != exeCache_.end();) it = IsWindow(it->first) ? std::next(it) : exeCache_.erase(it);
     for (auto it = tries_.begin(); it != tries_.end();) it = IsWindow(it->first) ? std::next(it) : tries_.erase(it);
+    for (auto it = seen_.begin(); it != seen_.end();) it = IsWindow(it->first) ? std::next(it) : seen_.erase(it);
     targets_.clear();
 
     // Group per monitor
     std::map<HMONITOR, std::vector<HWND>> perMon;
     for (HWND h : order_) perMon[MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST)].push_back(h);
+    splits_.clear();
     for (auto& [mon, wins] : perMon) {
-        auto rects = Layout((int)wins.size(), WorkArea(mon));
+        auto rects = Layout((int)wins.size(), WorkArea(mon), &ratios_[mon], &splits_[mon], &wins);
         for (size_t i = 0; i < wins.size() && i < rects.size(); ++i) {
             Place(wins[i], rects[i]);
             targets_[wins[i]] = rects[i];
@@ -402,11 +499,12 @@ void Tiler::RegisterHotkeys() {
     RegisterHotKey(w, HkFloat, ca, 'F');
     RegisterHotKey(w, HkLayout, ca, 'L');
     RegisterHotKey(w, HkRetile, ca, VK_SPACE);
+    RegisterHotKey(w, HkDebug, ca, 'D');   // Ctrl+Alt+D: write the debug file
     hotkeys_ = true;
 }
 
 void Tiler::UnregisterHotkeys() {
-    for (int id = HkToggle; id <= HkRetile; ++id) UnregisterHotKey(g_app.ctlWnd, id);
+    for (int id = HkToggle; id <= HkDebug; ++id) UnregisterHotKey(g_app.ctlWnd, id);
     hotkeys_ = false;
 }
 
@@ -435,6 +533,7 @@ void Tiler::OnHotkey(int id) {
         g_app.InvalidateAll();
         return;
     }
+    if (id == HkDebug) { DebugDump(); return; }
     if (!running_) return;
     HWND fg = GetForegroundWindow();
     int dx = 0, dy = 0;
@@ -468,4 +567,61 @@ void Tiler::OnHotkey(int id) {
         Retile();
         break;
     }
+}
+
+// ---------------------------------------------------------------------------
+// A report for finding bugs: Ctrl+Alt+D (or the button in Settings) writes skyline-debug.txt next to skyline.ini.
+void Tiler::DebugDump() {
+    std::wstring out = L"Skyline " SKYLINE_VERSION_W L"\r\n";
+    wchar_t b[700];
+    auto add = [&](const wchar_t* fmt, auto... a) { swprintf(b, 700, fmt, a...); out += b; };
+    add(L"settings: tiling=%d layout=%d gap=%d dockSpace=%d barAutohide=%d mode=%d\r\n", (int)g_app.settings.tilingEnabled,
+        g_app.settings.tilingLayout, g_app.settings.tilingGap, (int)g_app.settings.tilingDockSpace, (int)g_app.settings.barAutohide, g_app.settings.tilingMode);
+    std::vector<HMONITOR> mons;
+    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR m, HDC, LPRECT, LPARAM lp) -> BOOL { ((std::vector<HMONITOR>*)lp)->push_back(m); return TRUE; }, (LPARAM)&mons);
+    int n = 0;
+    for (HMONITOR m : mons) {
+        MONITORINFO mi{sizeof mi};
+        GetMonitorInfoW(m, &mi);
+        UINT dx = 96, dy = 96;
+        GetDpiForMonitor(m, MDT_EFFECTIVE_DPI, &dx, &dy);
+        RECT wa = WorkArea(m);
+        add(L"monitor %d%s: rcMonitor=(%ld,%ld,%ld,%ld) rcWork=(%ld,%ld,%ld,%ld) dpi=%u tilerArea=(%ld,%ld,%ld,%ld)\r\n", ++n,
+            (mi.dwFlags & MONITORINFOF_PRIMARY) ? L" PRIMARY" : L"", mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right, mi.rcMonitor.bottom,
+            mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom, dx, wa.left, wa.top, wa.right, wa.bottom);
+        for (auto& bar : g_app.bars) if (bar->Monitor() == m) out += bar->DebugLine();
+        if (Dock* d = g_app.DockOn(m)) add(L"  dock: topEdge=%d\r\n", d->TopEdge(m));
+    }
+    out += L"windows (visible, bigger than 200 px):\r\n";
+    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+        auto* self = (Tiler*)lp;
+        RECT r;
+        if (!IsWindowVisible(h) || !GetWindowRect(h, &r) || r.right - r.left < 200 || r.bottom - r.top < 100) return TRUE;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(h, &pid);
+        wchar_t cls[64] = {}, t[64] = {}, line[700];
+        GetClassNameW(h, cls, 64);
+        GetWindowTextW(h, t, 64);
+        RECT fb = FrameBounds(h);
+        auto tg = self->targets_.find(h);
+        swprintf(line, 700, L"  %ls | %ls | \"%ls\" rect=(%ld,%ld,%ld,%ld) frame=(%ld,%ld,%ld,%ld) style=%08lX ex=%08lX zoomed=%d manageable=%d floating=%d target=%ls\r\n",
+                 FileNameOf(ProcessImagePath(pid)).c_str(), cls, t, r.left, r.top, r.right, r.bottom, fb.left, fb.top, fb.right, fb.bottom,
+                 (unsigned long)GetWindowLongW(h, GWL_STYLE), (unsigned long)GetWindowLongW(h, GWL_EXSTYLE), (int)IsZoomed(h),
+                 (int)self->Manageable(h), (int)self->floating_.count(h),
+                 tg == self->targets_.end() ? L"-" : (std::to_wstring(tg->second.left) + L"," + std::to_wstring(tg->second.top) + L"," +
+                                                     std::to_wstring(tg->second.right) + L"," + std::to_wstring(tg->second.bottom)).c_str());
+        self->dbg_ += line;
+        return TRUE;
+    }, (LPARAM)this);
+    out += dbg_;
+    dbg_.clear();
+    std::wstring path = g_app.settings.path;
+    size_t slash = path.find_last_of(L"\\/");
+    path = (slash == std::wstring::npos ? L"" : path.substr(0, slash + 1)) + L"skyline-debug.txt";
+    int len = WideCharToMultiByte(CP_UTF8, 0, out.c_str(), (int)out.size(), nullptr, 0, nullptr, nullptr);
+    std::string u8(len, 0);
+    WideCharToMultiByte(CP_UTF8, 0, out.c_str(), (int)out.size(), u8.data(), len, nullptr, nullptr);
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE) { DWORD wr; WriteFile(f, u8.data(), (DWORD)u8.size(), &wr, nullptr); CloseHandle(f); }
+    MessageBeep(MB_OK);
 }

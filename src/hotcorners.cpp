@@ -96,7 +96,7 @@ void HotCorners::Check() {
 }
 
 void HotCorners::Run(int corner) {
-    if (corner < 0 || corner > 3 || PrimaryFullscreen()) return;   // never in the middle of a game
+    if (corner < 0 || corner > 3 || GameMode()) return;   // never in the middle of a game
     switch (g_app.settings.cornerAction[corner]) {
     case 1:   // all windows: our Mission Control when the plugin is on, else Windows' Task view
         if (MissionControl::Enabled()) MissionControl::Toggle();

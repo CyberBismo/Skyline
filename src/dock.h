@@ -33,6 +33,7 @@ public:
 
     void OnForeground(HWND h);      // from the global foreground hook
     void SetFullscreen(bool fs);
+    void FlushPending();   // after a game: do what was put off
     void KeepOnTop();               // back above every window (not while it steps behind Windows' Start)
     void StartMenuChanged(bool open);   // show the dock while a Start menu is open
     int TopEdge(HMONITOR mon) const;   // y where the dock starts on that monitor, or INT_MAX
@@ -74,7 +75,8 @@ private:
     void Evaluate();                 // smart hide decision
     bool CursorInRevealZone() const;
     RECT RevealStrip() const;
-    void UpdateReservation(bool force = false);   // reserve screen space when the dock never hides
+    void UpdateReservation(bool force = false);
+    bool pendingRes_ = false;                    // Windows moved app bars during a game: catch up afterwards   // reserve screen space when the dock never hides
     RECT reserved_{};                // what we last told Windows
     void SetShown(bool shown);
     void Animate();

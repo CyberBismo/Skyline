@@ -114,6 +114,8 @@ private:
     void Click(int row, D2D1_POINT_2F p);
     void SetSliderFromX(int row, float x);
     void ShowChoice(int row);
+    bool PickDockScreens(int count);   // tick the displays the dock should be on; false = cancelled
+    std::wstring dockScreensText_;
     void ScheduleApply();
     void ScheduleGlass();   // glass/tint only: restyle in place, no rebuild
 
@@ -528,14 +530,35 @@ void SettingsWindow::BuildPage(SettingsPage pg) {
                          (int)(mi.rcMonitor.bottom - mi.rcMonitor.top), mons[i] == primary ? TR(L"  (hoved)", L"  (main)") : L"");
                 screens.push_back(t);
             }
-            for (int k = (int)screens.size(); k <= s.dockMonitor; ++k) {   // a screen that's unplugged right now
+            int single = s.dockMonitor == kDockChosen ? 0 : s.dockMonitor;
+            for (int k = (int)screens.size(); k <= single; ++k) {   // a screen that's unplugged right now
                 wchar_t t[64];
                 swprintf(t, 64, TR(L"Skjerm %d  (ikke tilkoblet)", L"Display %d  (not connected)"), k - 1);
                 screens.push_back(t);
             }
+            screens.push_back(TR(L"Velg skjermer …", L"Choose displays …"));
+            int chosenIdx = (int)screens.size() - 1;
+            int count = (int)mons.size();
             choice(TR(L"Vis docken på", L"Show the dock on"), TR(L"Skjermene telles fra venstre mot høyre", L"Displays are numbered from left to right"), screens,
-                   [&s] { return s.dockMonitor; },
-                   [this, &s](int v) { s.dockMonitor = v; IniWrite(L"Dock", L"Monitor", v); ScheduleApply(); });
+                   [&s, chosenIdx] { return s.dockMonitor == kDockChosen ? chosenIdx : s.dockMonitor; },
+                   [this, &s, chosenIdx, count](int v) {
+                       if (v == chosenIdx) {
+                           if (!PickDockScreens(count)) return;
+                           v = kDockChosen;
+                       }
+                       s.dockMonitor = v;
+                       IniWrite(L"Dock", L"Monitor", v);
+                       ScheduleApply();
+                   });
+            if (s.dockMonitor == kDockChosen) {
+                std::wstring list;
+                for (int i : s.dockScreens) list += (list.empty() ? L"" : L", ") + std::to_wstring(i + 1);
+                dockScreensText_ = std::wstring(TR(L"Skjerm ", L"Display ")) + list;
+                button(TR(L"Skjermer med dock", L"Displays with a dock"), dockScreensText_, TR(L"Endre …", L"Change …"), [this, count] {
+                    if (PickDockScreens(count)) ScheduleApply();
+                    SetTimer(hwnd, T_APPLY + 1, 10, nullptr);
+                });
+            }
         }
         choice(TR(L"Treff-område nederst", L"Bottom reveal area"), TR(L"Hvor bredt området i bunnkanten er som henter frem docken", L"How wide the area along the bottom edge that brings up the dock is"),
                {TR(L"Bare under docken", L"Only under the dock"), TR(L"Litt bredere", L"A little wider"), TR(L"Mye bredere", L"Much wider"), TR(L"Hele bunnkanten", L"Entire bottom edge")},
@@ -588,6 +611,22 @@ void SettingsWindow::BuildPage(SettingsPage pg) {
                   L"When you search in SkyMenu, files and folders from your user folder show up too (Windows' own search index)"),
                [&s] { return s.menuFileSearch; },
                [&s](bool v) { s.menuFileSearch = v; IniWrite(L"Start", L"MenuFiles", v ? 1 : 0); });
+        choice(TR(L"SkyMenu: størrelse", L"SkyMenu: size"),
+               TR(L"Hele menyen skaleres: tekst, ikoner og mellomrom", L"The whole menu scales: text, icons and spacing"),
+               {TR(L"Liten", L"Small"), TR(L"Middels", L"Medium"), TR(L"Stor", L"Large"), TR(L"Ekstra stor", L"Extra large"),
+                TR(L"Egendefinert (dratt)", L"Custom (dragged)")},
+               [&s] { return s.menuSize; },
+               [&s](int v) { s.menuSize = v; IniWrite(L"Start", L"MenuSize", v); });
+        toggle(TR(L"SkyMenu: endre størrelse med musa", L"SkyMenu: resize with the mouse"),
+               TR(L"Dra i venstre, høyre eller øvre kant (eller hjørnene) av menyen. Størrelsen huskes som «Egendefinert».",
+                  L"Drag the left, right or top edge (or the corners) of the menu. The size is remembered as Custom."),
+               [&s] { return s.menuResize; },
+               [&s](bool v) { s.menuResize = v; IniWrite(L"Start", L"MenuResize", v ? 1 : 0); });
+        toggle(TR(L"SkyMenu: Anbefalt", L"SkyMenu: Recommended"),
+               TR(L"Filene du har åpnet sist, under de festede appene (fra Windows' egen liste over nylige filer)",
+                  L"The files you opened last, under the pinned apps (from Windows' own list of recent files)"),
+               [&s] { return s.menuRecent; },
+               [&s](bool v) { s.menuRecent = v; IniWrite(L"Start", L"MenuRecent", v ? 1 : 0); });
         button(TR(L"Festede apper", L"Pinned apps"),
                TR(L"Høyreklikk en app i SkyMenu eller SkyLauncher for å feste eller løsne den", L"Right-click an app in SkyMenu or SkyLauncher to pin or unpin it"),
                TR(L"Tilbakestill", L"Reset"), [] { IniWrite(L"SkyMenu", L"PinnedSet", 0); });
@@ -621,6 +660,8 @@ void SettingsWindow::BuildPage(SettingsPage pg) {
         toggle(TR(L"Gi plass til docken", L"Make room for the dock"), TR(L"Vinduer stopper over docken i stedet for å dekke den", L"Windows stop above the dock instead of covering it"),
                [&s] { return s.tilingDockSpace; },
                [&s](bool v) { s.tilingDockSpace = v; IniWrite(L"Tiling", L"DockSpace", v ? 1 : 0); TilingApply(); });
+        button(TR(L"Feilsøkingsfil", L"Debug file"), TR(L"Skriver skyline-debug.txt ved siden av skyline.ini (skjermer, topplinje, vinduer). Hurtigtast: Ctrl + Alt + D", L"Writes skyline-debug.txt next to skyline.ini (screens, bar, windows). Shortcut: Ctrl + Alt + D"),
+               TR(L"Skriv nå", L"Write now"), [] { if (g_app.tiler) g_app.tiler->DebugDump(); });
         info(TR(L"Bytt plass med musen", L"Swap with the mouse"), TR(L"Dra et vindu og slipp det oppå et annet, så bytter de plass.", L"Drag a window and drop it onto another to swap them."));
         if (s.tilingMode >= 1) {
             header(TR(L"Hurtigtaster", L"Keyboard shortcuts"));
@@ -935,6 +976,12 @@ void SettingsWindow::BuildPage(SettingsPage pg) {
         button(TR(L"Nytt bed", L"New bed"), TR(L"Eller høyreklikk et bed. Dra i tittelen for å flytte, i kantene for å endre størrelse, klikk tittelen for å rulle opp.",
                                               L"Or right-click a bed. Drag the title to move, the edges to resize, click the title to roll up."),
                TR(L"Lag", L"Create"), [] { Garden::NewBed(); });
+        if (!s.gardenEnabled) rows.back().enabled = false;
+        button(TR(L"Nytt mappe-bed", L"New folder bed"),
+               TR(L"Et bed som speiler en mappe, f.eks. Dokumenter eller Nedlastinger. Det oppdateres av seg selv, og filer du drar inn havner i mappen (ikke på skrivebordet).",
+                  L"A bed that mirrors a folder, e.g. Documents or Downloads. It updates by itself, and files you drag in go into the folder (not onto the desktop)."),
+               TR(L"Velg mappe …", L"Choose folder …"), [] { POINT c; GetCursorPos(&c); Garden::NewFolderBedAt(c); });
+        if (!s.gardenEnabled) rows.back().enabled = false;
         button(TR(L"Oppsett", L"Layout"), TR(L"Start på nytt med Apper og Skrivebord", L"Start over with Apps and Desktop"),
                TR(L"Tilbakestill", L"Reset"), [] { Garden::ResetLayout(); });
         header(TR(L"Klokke i docken", L"Clock in the dock"));
@@ -1228,11 +1275,11 @@ void SettingsWindow::DrawButtonish(D2D1_RECT_F r, const std::wstring& text, bool
 
 void SettingsWindow::DrawCard(const Row& r, D2D1_RECT_F c, bool hover) {
     Pal p = P();
-    auto rr = D2D1::RoundedRect(c, 6, 6);
+    auto rr = D2D1::RoundedRect(c, 8, 8);
     br->SetColor(hover && (r.type == Row::Toggle) ? p.cardHover : p.card);
     rt->FillRoundedRectangle(rr, br.Get());
     br->SetColor(p.cardStroke);
-    rt->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.left + 0.5f, c.top + 0.5f, c.right - 0.5f, c.bottom - 0.5f), 5.5f, 5.5f),
+    rt->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.left + 0.5f, c.top + 0.5f, c.right - 0.5f, c.bottom - 0.5f), 7.5f, 7.5f),
                              br.Get(), 1.0f);
 }
 
@@ -1411,6 +1458,55 @@ void SettingsWindow::SetSliderFromX(int i, float x) {
     int v = r.min + (int)std::lround(frac * (r.max - r.min) / r.step) * r.step;
     dragValue = std::clamp(v, r.min, r.max);
     Invalidate();
+}
+
+// A little menu of checkboxes: click displays on and off, then Done
+bool SettingsWindow::PickDockScreens(int count) {
+    Settings& s = g_app.settings;
+    std::vector<int> pick = s.dockScreens;
+    if (pick.empty()) pick.push_back(0);
+    POINT pt;
+    GetCursorPos(&pt);
+    for (;;) {
+        HMENU m = CreatePopupMenu();
+        auto mons = MonitorsLeftToRight();
+        HMONITOR primary = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        for (int i = 0; i < std::max(count, (int)mons.size()); ++i) {
+            wchar_t t[96];
+            if (i < (int)mons.size()) {
+                MONITORINFO mi{sizeof mi};
+                GetMonitorInfoW(mons[i], &mi);
+                swprintf(t, 96, TR(L"Skjerm %d  ·  %d×%d%s", L"Display %d  ·  %d×%d%s"), i + 1, (int)(mi.rcMonitor.right - mi.rcMonitor.left),
+                         (int)(mi.rcMonitor.bottom - mi.rcMonitor.top), mons[i] == primary ? TR(L"  (hoved)", L"  (main)") : L"");
+            } else {
+                swprintf(t, 96, TR(L"Skjerm %d  (ikke tilkoblet)", L"Display %d  (not connected)"), i + 1);
+            }
+            bool on = std::find(pick.begin(), pick.end(), i) != pick.end();
+            AppendMenuW(m, MF_STRING | (on ? MF_CHECKED : 0), 100 + i, t);
+        }
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(m, MF_STRING | (pick.empty() ? MF_GRAYED : 0), 1, TR(L"Ferdig", L"Done"));
+        int cmd;
+        {
+            MenuGuard guard;
+            cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_NONOTIFY, pt.x, pt.y, hwnd, nullptr);
+        }
+        DestroyMenu(m);
+        if (cmd == 0) return false;   // clicked outside / Esc: nothing changes
+        if (cmd == 1) break;
+        int i = cmd - 100;
+        auto it = std::find(pick.begin(), pick.end(), i);
+        if (it != pick.end()) pick.erase(it);
+        else pick.push_back(i);
+    }
+    std::sort(pick.begin(), pick.end());
+    s.dockScreens = pick;
+    std::wstring v;
+    for (int i : pick) v += (v.empty() ? L"" : L",") + std::to_wstring(i + 1);
+    IniWrite(L"Dock", L"Screens", v);
+    s.dockMonitor = kDockChosen;
+    IniWrite(L"Dock", L"Monitor", kDockChosen);
+    return true;
 }
 
 void SettingsWindow::ShowChoice(int i) {

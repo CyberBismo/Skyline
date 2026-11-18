@@ -397,7 +397,7 @@ std::wstring IniString(const wchar_t* sec, const wchar_t* key) {
 void MaybePrompt() {
     KillTimer(g_wnd, T_PROMPT);
     if (g_state != Update::State::Available || IniString(L"Update", L"Notified") == g_avail.version) return;
-    if (PrimaryFullscreen()) { SetTimer(g_wnd, T_PROMPT, kPromptRetry, nullptr); return; }
+    if (GameMode()) { SetTimer(g_wnd, T_PROMPT, kPromptRetry, nullptr); return; }
     IniWrite(L"Update", L"Notified", g_avail.version);
     Dialog::Spec d;
     d.caption = TR(L"Skyline – oppdatering", L"Skyline – update");

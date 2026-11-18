@@ -472,6 +472,27 @@ void Dock::LoadIcon(App& a) {
     int pxH = (int)std::lround(g_app.settings.dockIconDip * kHoverScale * dpi_ / 96.0f);
     a.img = LoadAppImage(a.target, px);
     a.imgHover = LoadAppImage(a.target, pxH);
+    // No picture for that target? Some apps give their windows an id that has no Start-menu entry to take an
+    // icon from (Steam's "Valve.Steam.Client" on many PCs): then the icon was simply empty. Try the exe behind
+    // the window, and last of all the icon the window itself shows.
+    if (!a.img && !a.exe.empty() && Lower(a.exe) != Lower(a.target)) {
+        a.img = LoadAppImage(a.exe, px);
+        a.imgHover = LoadAppImage(a.exe, pxH);
+    }
+    if (!a.img) {
+        for (HWND h : a.windows) {
+            HICON ic = nullptr;
+            DWORD_PTR r = 0;
+            if (SendMessageTimeoutW(h, WM_GETICON, ICON_BIG, 0, SMTO_ABORTIFHUNG, 100, &r) && r) ic = (HICON)r;
+            if (!ic) ic = (HICON)GetClassLongPtrW(h, GCLP_HICON);
+            if (!ic && SendMessageTimeoutW(h, WM_GETICON, ICON_SMALL2, 0, SMTO_ABORTIFHUNG, 100, &r) && r) ic = (HICON)r;
+            if (!ic) continue;
+            a.img = ImageFromIcon(ic, px);
+            a.imgHover = ImageFromIcon(ic, pxH);
+            if (a.img) break;
+        }
+    }
+    if (a.img && !a.imgHover) a.imgHover = a.img;
     if (a.name.empty()) {
         ComPtr<IShellItem> item;
         if (SUCCEEDED(SHCreateItemFromParsingName(a.target.c_str(), nullptr, IID_PPV_ARGS(item.Put())))) {
@@ -736,6 +757,15 @@ void Dock::Paint() {
     }
     PaintVibe(rt_.Get(), D2D1::RectF(0, 0, sz.width, sz.height), Part::Dock);   // Vibe: the colours of the hour
     PaintLiquid(rt_.Get(), D2D1::RectF(0, 0, sz.width, sz.height), 8, 2);   // Liquid Glass / Nordlys
+    {   // a fine light edge along the top, fading out to the sides: gives the glass depth
+        ComPtr<ID2D1GradientStopCollection> gsc;
+        ComPtr<ID2D1LinearGradientBrush> rim;
+        float a = th.dark ? 0.20f : 0.55f;
+        D2D1_GRADIENT_STOP gs[3] = {{0, D2D1::ColorF(1, 1, 1, 0)}, {0.5f, D2D1::ColorF(1, 1, 1, a)}, {1, D2D1::ColorF(1, 1, 1, 0)}};
+        if (SUCCEEDED(rt_->CreateGradientStopCollection(gs, 3, gsc.Put())) &&
+            SUCCEEDED(rt_->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties(D2D1::Point2F(0, 0), D2D1::Point2F(sz.width, 0)), gsc.Get(), rim.Put())))
+            rt_->FillRectangle(D2D1::RectF(0, 0, sz.width, 1.0f), rim.Get());
+    }
 
     for (size_t i = 0; i < apps_.size(); ++i) {
         App& a = apps_[i];
@@ -819,7 +849,13 @@ void Dock::Paint() {
             D2D1_COLOR_F dot = a.attention ? D2D1::ColorF(1.0f, 0.62f, 0.2f, 1)
                                            : D2D1::ColorF(th.fg.r, th.fg.g, th.fg.b, active ? 0.95f : 0.5f);
             brush_->SetColor(dot);
-            float r = active ? 2.0f : 1.7f;
+            float r = active ? 2.1f : 1.7f;
+            if (active) {   // a soft halo behind the dot of the active app
+                D2D1_COLOR_F hc = dot; hc.a = 0.22f;
+                brush_->SetColor(hc);
+                rt_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, sz.height - 3.5f), r + 2.0f, r + 2.0f), brush_.Get());
+                brush_->SetColor(dot);
+            }
             rt_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, sz.height - 3.5f), r, r), brush_.Get());
         }
     }
@@ -1574,9 +1610,16 @@ void Dock::SetFullscreen(bool fs) {
         if (tip_) { TOOLINFOW ti{sizeof ti}; ti.hwnd = hwnd_; ti.uId = 1; SendMessageW(tip_, TTM_TRACKACTIVATE, FALSE, (LPARAM)&ti); }
         if (trigger_) ShowWindow(trigger_, SW_HIDE);   // no edge reveal in games
     } else {
+        FlushPending();
         Evaluate();
         if (!shown_ && trigger_) ShowWindow(trigger_, SW_SHOWNOACTIVATE);
     }
+}
+
+void Dock::FlushPending() {
+    if (fullscreen_ || GameMode() || !pendingRes_) return;
+    pendingRes_ = false;
+    UpdateReservation(true);
 }
 
 void Dock::KeepOnTop() {
@@ -1968,7 +2011,7 @@ LRESULT Dock::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         if (!mouseInside_) SetTimer(hwnd_, T_HIDEDELAY, 500, nullptr);
         return 0;
     case WM_APP + 30:   // appbar notifications
-        if (wp == ABN_POSCHANGED) UpdateReservation(true);
+        if (wp == ABN_POSCHANGED) { if (!fullscreen_ && !GameMode()) UpdateReservation(true); else pendingRes_ = true; }
         return 0;
     case WM_WINDOWPOSCHANGED:
         if (badges_) {   // the badge layer goes where the dock goes
@@ -1996,7 +2039,7 @@ LRESULT Dock::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
     case WM_DISPLAYCHANGE:
-        Layout();
+        if (!fullscreen_ && !GameMode()) Layout();   // during a game: the docks are rebuilt once it's over
         return 0;
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;

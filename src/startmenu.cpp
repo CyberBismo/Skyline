@@ -466,6 +466,12 @@ protected:
 };
 
 // ===========================================================================
+// Recent files (Windows' Recent folder): SkyMenu's "Recommended" and VibeMenu's "Pick up where you left off"
+struct RecentFile { AppEntry a; ULONGLONG when = 0; };
+std::vector<RecentFile> RecentFiles(size_t n);
+std::wstring Ago(ULONGLONG when);
+
+// ===========================================================================
 // SkyMenu pins (its own list; starts as a copy of the dock's)
 // ===========================================================================
 std::vector<std::wstring> MenuPins() {
@@ -528,12 +534,14 @@ void ShutDownPc() {
 }
 
 void PowerMenu(HWND owner, POINT at) {
-    enum { CLock = 1, CSignOut, CSleep, CRestart, CShutdown };
+    enum { CLock = 1, CSignOut, CSleep, CRestart, CShutdown, CHibernate, CSwitch };
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, CLock, TR(L"Lås", L"Lock"));
+    AppendMenuW(m, MF_STRING, CSwitch, TR(L"Bytt bruker", L"Switch user"));
     AppendMenuW(m, MF_STRING, CSignOut, TR(L"Logg av", L"Sign out"));
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, CSleep, TR(L"Hvilemodus", L"Sleep"));
+    if (IsPwrHibernateAllowed()) AppendMenuW(m, MF_STRING, CHibernate, TR(L"Dvalemodus", L"Hibernate"));
     AppendMenuW(m, MF_STRING, CRestart, TR(L"Start på nytt", L"Restart"));
     AppendMenuW(m, MF_STRING, CShutdown, TR(L"Slå av", L"Shut down"));
     int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_BOTTOMALIGN | TPM_RIGHTALIGN | TPM_NONOTIFY, at.x, at.y, 0, owner, nullptr);
@@ -547,6 +555,8 @@ void PowerMenu(HWND owner, POINT at) {
     case CLock: LockWorkStation(); break;
     case CSignOut: ExitWindowsEx(EWX_LOGOFF, 0); break;
     case CSleep: EnableShutdownPrivilege(); SetSuspendState(FALSE, FALSE, FALSE); break;
+    case CHibernate: EnableShutdownPrivilege(); SetSuspendState(TRUE, FALSE, FALSE); break;
+    case CSwitch: LockWorkStation(); break;   // the lock screen is where Windows lets another user sign in
     case CRestart: RestartPc(); break;
     case CShutdown: ShutDownPc(); break;
     }
@@ -1839,16 +1849,19 @@ public:
         dpi_ = MonitorDpi(mon_);
         MONITORINFO mi{sizeof mi};
         GetMonitorInfoW(mon_, &mi);
-        float W = 620, H = 580;
-        int w = MulDiv((int)W, dpi_, 96), h = MulDiv((int)H, dpi_, 96);
-        h = std::min<int>(h, (mi.rcWork.bottom - mi.rcWork.top) - MulDiv(24, dpi_, 96));
+        float W = kDesignW, H = DesignH();
+        static const int presets[4] = {85, 100, 120, 145};
+        const Settings& cs = g_app.settings;
+        scale_ = (cs.menuSize >= 0 && cs.menuSize < 4 ? presets[cs.menuSize] : cs.menuScalePct) / 100.0f;
         int bottom = mi.rcWork.bottom - MulDiv(12, dpi_, 96);
         if (Dock* d = g_app.DockOn(mon_)) {
             int top = d->TopEdge(mon_);
             if (top != INT_MAX) bottom = std::min(bottom, top - MulDiv(10, dpi_, 96));
         }
-        h = std::min(h, bottom - ((int)mi.rcWork.top + MulDiv(12, dpi_, 96)));   // never above the top of the screen
+        scale_ = std::min(scale_, FitScale(mi.rcWork, bottom));   // never bigger than the screen allows
+        int w = (int)std::lround(W * scale_ * dpi_ / 96.0f), h = (int)std::lround(H * scale_ * dpi_ / 96.0f);
         int left = mi.rcMonitor.left + (mi.rcMonitor.right - mi.rcMonitor.left - w) / 2;
+        resizing_ = false;
         RECT r{left, bottom - h, left + w, bottom};
         if (!CreateAt(r, WS_EX_TOOLWINDOW | WS_EX_TOPMOST)) return;
         Glass(hwnd_, (BYTE)std::clamp(g_app.settings.tintPercent * 255 / 100 + 30, 0, 255), true);
@@ -1861,19 +1874,30 @@ public:
         pinDragging_ = false;
         downPin_ = dragPin_ = -1;
         LoadPins();
+        recent_.clear();
+        if (g_app.settings.menuRecent) recent_ = RecentFiles(6);
         if (AllApps(0xFFFFFFFF).empty()) AllApps();
         name_ = UserDisplayName();
         avatar_.Reset();
-        int apx = MulDiv(44, dpi_, 96);
+        int apx = (int)std::lround(44 * scale_ * dpi_ / 96.0f);
         if (!avatarSrc_ || avatarPx_ != apx) { avatarSrc_ = AccountPicture(apx); avatarPx_ = apx; }
         ShowAnimated();
-        PrewarmIcons(MulDiv(24, dpi_, 96));   // for "All apps"
+        PrewarmIcons((int)std::lround(24 * scale_ * dpi_ / 96.0f));   // for "All apps"
         SetTimer(hwnd_, T_REFRESH, 450, nullptr);
+    }
+
+    static constexpr float kDesignW = 640;
+    static float DesignH() { return g_app.settings.menuRecent ? 660.0f : 580.0f; }
+    // the biggest scale that keeps the menu on the screen (width, and height above the dock / below the top)
+    float FitScale(const RECT& work, int bottom) const {
+        float byW = ((work.right - work.left) - MulDiv(24, dpi_, 96)) * 96.0f / dpi_ / kDesignW;
+        float byH = (bottom - ((int)work.top + MulDiv(12, dpi_, 96))) * 96.0f / dpi_ / DesignH();
+        return std::max(0.5f, std::min(byW, byH));
     }
 
 protected:
     enum Mode { Pinned, All, Search, Letters };
-    enum HitKind { HNone, HApp, HAllButton, HBackButton, HLetter, HLetterPick, HPlace, HUser, HPower, HFileSearch };
+    enum HitKind { HNone, HApp, HAllButton, HBackButton, HLetter, HLetterPick, HPlace, HUser, HPower, HFileSearch, HRecent, HLetters, HLock };
     struct Hit { D2D1_RECT_F r; HitKind kind; int idx; };
 
     const wchar_t* ClassName() const override { return L"SkylineSkyMenu"; }
@@ -1930,7 +1954,8 @@ protected:
     static const std::vector<Place>& Places() {
         static const std::vector<Place> p = {
             {0xE8A5, L"Dokumenter", L"Documents", 0}, {0xE896, L"Nedlastinger", L"Downloads", 1}, {0xE91B, L"Bilder", L"Pictures", 2},
-            {0xE8D6, L"Musikk", L"Music", 3},         {0xE714, L"Videoer", L"Videos", 4},          {0xE7F4, L"Denne PC-en", L"This PC", 5},
+            {0xE8D6, L"Musikk", L"Music", 3},         {0xE714, L"Videoer", L"Videos", 4},          {0xEC50, L"Filutforsker", L"File Explorer", 8},
+            {0xE7F4, L"Denne PC-en", L"This PC", 5},
             {0, nullptr, nullptr, -1},
             {0xE713, L"Innstillinger", L"Settings", 6}, {0xE771, L"Skyline", L"Skyline", 7},
         };
@@ -1948,6 +1973,7 @@ protected:
         case 5: ShellExecuteW(nullptr, L"open", L"shell:MyComputerFolder", nullptr, nullptr, SW_SHOWNORMAL); break;
         case 6: ShellExecuteW(nullptr, nullptr, L"ms-settings:", nullptr, nullptr, SW_SHOWNORMAL); break;
         case 7: ShowSettings(SettingsPage::General); break;
+        case 8: ShellExecuteW(nullptr, L"open", L"explorer.exe", nullptr, nullptr, SW_SHOWNORMAL); break;
         }
     }
 
@@ -1982,7 +2008,7 @@ protected:
     void Paint() override {
         const Theme& th = g_app.theme;
         D2D1_SIZE_F sz = rt_->GetSize();
-        float W = sz.width, H = sz.height;
+        float W = sz.width / scale_, H = sz.height / scale_;   // design size: everything below is laid out at scale 1
         if (!fText_) {
             fText_ = Format(L"Segoe UI", 13.5f);
             fSmall_ = Format(L"Segoe UI", 12, DWRITE_FONT_WEIGHT_SEMI_BOLD);
@@ -1995,6 +2021,7 @@ protected:
         }
         hits_.clear();
         rt_->BeginDraw();
+        rt_->SetTransform(D2D1::Matrix3x2F::Scale(scale_, scale_));
         {
             rt_->Clear(D2D1::ColorF(0, 0, 0, 0));
             brush_->SetColor(GlassTint(Part::Start));
@@ -2008,7 +2035,7 @@ protected:
         bool fading = anim_ < 0.999f;   // no layer once fully open: cheaper frames
         if (fading) {
             rt_->CreateLayer(layer.Put());
-            rt_->SetTransform(D2D1::Matrix3x2F::Translation(0, 14 * (1 - anim_)));
+            rt_->SetTransform(D2D1::Matrix3x2F::Translation(0, 14 * (1 - anim_)) * D2D1::Matrix3x2F::Scale(scale_, scale_));
             rt_->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(), nullptr, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                                                  D2D1::IdentityMatrix(), anim_),
                            layer.Get());
@@ -2019,7 +2046,7 @@ protected:
 
         float split = std::floor(W * 0.62f);
         float top = 68, bottom = H - 58;
-        int px = (int)std::lround(24 * dpi_ / 96.0f);
+        int px = (int)std::lround(24 * scale_ * dpi_ / 96.0f);
 
         auto pill = [&](const wchar_t* text, bool rightSide, HitKind k, float y) {
             float tw = TextWidth(text, fDim_.Get()) + 22;
@@ -2058,14 +2085,43 @@ protected:
                 if (pinDragging_ && i == dragPin_) continue;   // drawn last, under the mouse
                 if (y + kAppRow > top && y < bottom) appRow(pins_[i], D2D1::RectF(12, y, split - 12, y + kAppRow - 2), i, false, nullptr);
             }
+            // Recommended: the latest files (Windows' own Recent list), like the Windows 11 Start menu
+            float extra = 0;
+            if (!recent_.empty()) {
+                float hy = y + 10;
+                if (hy + 26 > top && hy < bottom) DrawText(TR(L"Anbefalt", L"Recommended"), fSmall_.Get(), D2D1::RectF(22, hy, split, hy + 26), th.fgDim);
+                float ry = hy + 30;
+                for (int i = 0; i < (int)recent_.size(); ++i, ry += kAppRow) {
+                    if (ry + kAppRow <= top || ry >= bottom) continue;
+                    D2D1_RECT_F r = D2D1::RectF(12, ry, split - 12, ry + kAppRow - 2);
+                    int me = (int)hits_.size();
+                    hits_.push_back({r, HRecent, i});
+                    if (me == hover_) { brush_->SetColor(th.hover); rt_->FillRoundedRectangle(D2D1::RoundedRect(r, 6, 6), brush_.Get()); }
+                    float ic = 24, cy = (r.top + r.bottom) / 2;
+                    D2D1_RECT_F ir = D2D1::RectF(r.left + 10, cy - ic / 2, r.left + 10 + ic, cy + ic / 2);
+                    if (ID2D1Bitmap* b = Icon(recent_[i].a, px)) DrawImageHQ(rt_.Get(), b, ir);
+                    DrawText(recent_[i].a.name, fText_.Get(), D2D1::RectF(ir.right + 12, r.top, r.right - 110, r.bottom), th.fg);
+                    DrawText(Ago(recent_[i].when), fDim_.Get(), D2D1::RectF(r.right - 108, r.top, r.right - 10, r.bottom), th.fgDim);
+                }
+                extra = 40 + recent_.size() * kAppRow;
+            }
             if (pinDragging_ && dragPin_ >= 0 && dragPin_ < (int)pins_.size()) {
                 float dy = std::clamp(dragY_ - grabDy_, top + 34 - kAppRow / 2, bottom - kAppRow / 2);
                 appRow(pins_[dragPin_], D2D1::RectF(12, dy, split - 12, dy + kAppRow - 2), dragPin_, true, nullptr);
             }
-            contentH_ = 34 + pins_.size() * kAppRow;
+            contentH_ = 34 + pins_.size() * kAppRow + extra;
         } else if (mode_ == All || mode_ == Letters) {
             DrawText(TR(L"Alle apper", L"All apps"), fSmall_.Get(), D2D1::RectF(22, top, split, top + 26), th.fgDim);
             pill(TR(L"‹  Tilbake", L"‹  Back"), true, HBackButton, top);
+            if (mode_ == All) {   // the letters: jump straight to an app
+                float tw = TextWidth(TR(L"‹  Tilbake", L"‹  Back"), fDim_.Get()) + 22;
+                D2D1_RECT_F r = D2D1::RectF(split - 12 - tw - 8 - 46, top, split - 12 - tw - 8, top + 26);
+                int me = (int)hits_.size();
+                hits_.push_back({r, HLetters, 0});
+                brush_->SetColor(me == hover_ ? Alpha(th.fg, 0.14f) : Alpha(th.fg, 0.07f));
+                rt_->FillRoundedRectangle(D2D1::RoundedRect(r, 6, 6), brush_.Get());
+                DrawText(L"A–Z", fDim_.Get(), D2D1::RectF(r.left + 10, r.top, r.right, r.bottom), th.fg);
+            }
             if (mode_ == All) {
                 auto rows = AllRows();
                 const auto& apps = AllApps(0xFFFFFFFF);
@@ -2192,6 +2248,16 @@ protected:
             DrawGlyph(0xE7E8, fGlyph_.Get(), D2D1::RectF(r.left + 6, r.top, r.left + 32, r.bottom), th.fg);
             DrawText(label, fText_.Get(), D2D1::RectF(r.left + 36, r.top, r.right, r.bottom), th.fg);
         }
+        {   // lock, one click (left of power)
+            const wchar_t* label = TR(L"Av/på", L"Power");
+            float tw = TextWidth(label, fText_.Get());
+            float right = W - 24 - tw - 40 - 8;
+            D2D1_RECT_F r = D2D1::RectF(right - 36, bottom + 11, right, H - 11);
+            int me = (int)hits_.size();
+            hits_.push_back({r, HLock, 0});
+            if (me == hover_) { brush_->SetColor(th.hover); rt_->FillRoundedRectangle(D2D1::RoundedRect(r, 6, 6), brush_.Get()); }
+            DrawGlyph(0xE72E, fGlyph_.Get(), r, th.fg);
+        }
         DrawText(L"Skyline", fDim_.Get(), D2D1::RectF(22, bottom, 200, H), Alpha(th.fgDim, 0.8f));
 
         if (fading) rt_->PopLayer();
@@ -2207,7 +2273,7 @@ protected:
         for (int i = (int)hitsPrev_.size() - 1; i >= 0; --i)
             if (In(hitsPrev_[i].r, x, yy)) {
                 // list rows are clipped to the list area
-                if (hitsPrev_[i].kind == HApp || hitsPrev_[i].kind == HLetter || hitsPrev_[i].kind == HFileSearch)
+                if (hitsPrev_[i].kind == HApp || hitsPrev_[i].kind == HLetter || hitsPrev_[i].kind == HFileSearch || hitsPrev_[i].kind == HRecent)
                     if (yy < listTop_ || yy > listBottom_) continue;
                 return i;
             }
@@ -2215,6 +2281,7 @@ protected:
     }
 
     const AppEntry* AppOf(const Hit& h) const {
+        if (h.kind == HRecent) return h.idx < (int)recent_.size() ? &recent_[h.idx].a : nullptr;
         if (h.kind != HApp) return nullptr;
         if (mode_ == Pinned) return h.idx < (int)pins_.size() ? &pins_[h.idx] : nullptr;
         if (mode_ == Search) return h.idx < (int)results_.size() ? &results_[h.idx] : nullptr;
@@ -2224,7 +2291,9 @@ protected:
 
     void Activate(const Hit& h) {
         switch (h.kind) {
-        case HApp: if (const AppEntry* a = AppOf(h)) { AppEntry copy = *a; Close(); LaunchApp(copy); } break;
+        case HApp: case HRecent: if (const AppEntry* a = AppOf(h)) { AppEntry copy = *a; Close(); LaunchApp(copy); } break;
+        case HLetters: mode_ = Letters; hover_ = -1; break;
+        case HLock: Close(); LockWorkStation(); break;
         case HAllButton: mode_ = All; scroll_ = 0; hover_ = -1; break;
         case HBackButton: mode_ = Pinned; scroll_ = 0; hover_ = -1; break;
         case HLetter: mode_ = Letters; hover_ = -1; break;
@@ -2242,7 +2311,7 @@ protected:
         case HPlace: OpenPlace(h.idx); break;
         case HUser: Close(); ShellExecuteW(nullptr, nullptr, L"ms-settings:yourinfo", nullptr, nullptr, SW_SHOWNORMAL); break;
         case HPower: {
-            POINT p{(LONG)(h.r.right * dpi_ / 96.0f), (LONG)(h.r.top * dpi_ / 96.0f)};
+            POINT p{(LONG)(h.r.right * scale_ * dpi_ / 96.0f), (LONG)(h.r.top * scale_ * dpi_ / 96.0f)};
             ClientToScreen(hwnd_, &p);
             inMenu_ = true;
             PowerMenu(hwnd_, p);
@@ -2261,9 +2330,32 @@ protected:
         scroll_ = std::clamp(scroll_, 0.0f, std::max(0.0f, contentH_ - view + 8));
     }
 
+    // Which edge of the menu is under a point (window dip), when resizing with the mouse is on: 1 left, 2 right, 4 top
+    int EdgeAt(float rx, float ry) const {
+        if (!g_app.settings.menuResize || !rt_) return 0;
+        D2D1_SIZE_F sz = rt_->GetSize();
+        const float m = 6;
+        int e = 0;
+        if (rx < m) e |= 1;
+        if (rx > sz.width - m) e |= 2;
+        if (ry < m) e |= 4;
+        return e;
+    }
+
     LRESULT Handle(UINT msg, WPARAM wp, LPARAM lp) override {
-        float x = GET_X_LPARAM(lp) * 96.0f / dpi_, y = GET_Y_LPARAM(lp) * 96.0f / dpi_;
+        float rx = GET_X_LPARAM(lp) * 96.0f / dpi_, ry = GET_Y_LPARAM(lp) * 96.0f / dpi_;   // window dip
+        float x = rx / scale_, y = ry / scale_;                                               // design dip
         switch (msg) {
+        case WM_SETCURSOR: {
+            if (LOWORD(lp) != HTCLIENT || !g_app.settings.menuResize) break;
+            POINT cp;
+            GetCursorPos(&cp);
+            ScreenToClient(hwnd_, &cp);
+            int e = resizing_ ? resizeEdge_ : EdgeAt(cp.x * 96.0f / dpi_, cp.y * 96.0f / dpi_);
+            if (!e) break;
+            SetCursor(LoadCursorW(nullptr, (e == 5) ? IDC_SIZENWSE : (e == 6) ? IDC_SIZENESW : (e & 4) ? IDC_SIZENS : IDC_SIZEWE));
+            return TRUE;
+        }
         case WM_TIMER:
             if (wp == T_REFRESH) {
                 KillTimer(hwnd_, T_REFRESH);
@@ -2296,6 +2388,22 @@ protected:
                 TrackMouseEvent(&t);
                 tracking_ = true;
             }
+            if (resizing_) {   // grow or shrink from the bottom centre: the distance from there decides the size
+                POINT pt;
+                GetCursorPos(&pt);
+                float sx = (resizeEdge_ & 3) ? 2.0f * std::fabs((float)(pt.x - centerX_)) * 96.0f / dpi_ / kDesignW : 0.0f;
+                float sy = (resizeEdge_ & 4) ? (float)(bottomY_ - pt.y) * 96.0f / dpi_ / DesignH() : 0.0f;
+                MONITORINFO mi{sizeof mi};
+                GetMonitorInfoW(mon_, &mi);
+                float s = std::clamp(std::max(sx, sy), 0.6f, std::max(0.6f, std::min(2.0f, FitScale(mi.rcWork, (int)bottomY_))));
+                if (std::fabs(s - scale_) > 0.004f) {
+                    scale_ = s;
+                    int w = (int)std::lround(kDesignW * s * dpi_ / 96.0f), hh = (int)std::lround(DesignH() * s * dpi_ / 96.0f);
+                    SetWindowPos(hwnd_, nullptr, centerX_ - w / 2, bottomY_ - hh, w, hh, SWP_NOZORDER | SWP_NOACTIVATE);
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                }
+                return 0;
+            }
             if (downPin_ >= 0 && (wp & MK_LBUTTON) && mode_ == Pinned) {
                 if (!pinDragging_ && std::fabs(y - downPt_.y) > 5) {
                     pinDragging_ = true;
@@ -2310,12 +2418,23 @@ protected:
             return 0;
         }
         case WM_LBUTTONDOWN: {
+            if (int e = EdgeAt(rx, ry)) {   // an edge: resize with the mouse
+                RECT wr;
+                GetWindowRect(hwnd_, &wr);
+                resizing_ = true;
+                resizeEdge_ = e;
+                centerX_ = (wr.left + wr.right) / 2;
+                bottomY_ = wr.bottom;
+                SetCapture(hwnd_);
+                return 0;
+            }
             downPin_ = -1;
             int h = HitAt(x, y);
             if (mode_ == Pinned && h >= 0 && hitsPrev_[h].kind == HApp) { downPin_ = hitsPrev_[h].idx; downPt_ = {x, y}; }
             return 0;
         }
         case WM_CAPTURECHANGED:
+            if (resizing_ && (HWND)lp != hwnd_) resizing_ = false;
             if (pinDragging_ && (HWND)lp != hwnd_) PinDragEnd();   // capture taken away: keep what we have
             return 0;
         case WM_MOUSELEAVE:
@@ -2324,6 +2443,15 @@ protected:
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
         case WM_LBUTTONUP: {
+            if (resizing_) {   // keep the size the user chose
+                resizing_ = false;
+                if (GetCapture() == hwnd_) ReleaseCapture();
+                g_app.settings.menuSize = 4;
+                g_app.settings.menuScalePct = std::clamp((int)std::lround(scale_ * 100), 60, 200);
+                IniWrite(L"Start", L"MenuSize", 4);
+                IniWrite(L"Start", L"MenuScale", g_app.settings.menuScalePct);
+                return 0;
+            }
             if (pinDragging_) { PinDragEnd(); return 0; }
             downPin_ = -1;
             int h = HitAt(x, y);
@@ -2339,10 +2467,11 @@ protected:
             POINT s{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             ClientToScreen(hwnd_, &s);
             inMenu_ = true;
-            bool launched = AppContextMenu(hwnd_, copy, s, IsMenuPinned(copy), [this, copy](bool pin) {
-                SetMenuPinned(copy, pin);
-                LoadPins();
-            });
+            bool launched = copy.file ? AppContextMenu(hwnd_, copy, s, false, nullptr)   // a recent file: open / open location
+                                      : AppContextMenu(hwnd_, copy, s, IsMenuPinned(copy), [this, copy](bool pin) {
+                                            SetMenuPinned(copy, pin);
+                                            LoadPins();
+                                        });
             inMenu_ = false;
             if (!hwnd_) return 0;   // closed while the menu was open
             if (launched || GetForegroundWindow() != hwnd_) Close();
@@ -2374,6 +2503,7 @@ protected:
 private:
     Mode mode_ = Pinned;
     std::vector<AppEntry> pins_, results_;
+    std::vector<RecentFile> recent_;      // "Recommended"
     std::vector<std::wstring> pinKeys_;   // what's saved for each pin, same order as pins_
     unsigned fileTicket_ = 0;             // the newest file search; older answers are dropped
     int downPin_ = -1, dragPin_ = -1;
@@ -2383,6 +2513,10 @@ private:
     std::vector<Hit> hits_, hitsPrev_;
     int hover_ = -1, sel_ = 0;
     bool tracking_ = false;
+    float scale_ = 1;                    // the menu's size (1 = 640 x 660 dip); everything is drawn at design size and scaled
+    bool resizing_ = false;              // the user is dragging an edge
+    int resizeEdge_ = 0;                 // 1 left, 2 right, 4 top
+    LONG centerX_ = 0, bottomY_ = 0;     // the fixed point while resizing (the menu grows from its bottom centre)
     float scroll_ = 0, contentH_ = 0, listTop_ = 68, listBottom_ = 500;
     std::wstring name_;
     ComPtr<IWICBitmapSource> avatarSrc_;
@@ -2968,7 +3102,6 @@ bool RecentTrackingOff() {
 }
 
 // Your latest files, from Windows' Recent folder (read only when the menu opens), with when you used them
-struct RecentFile { AppEntry a; ULONGLONG when = 0; };
 std::vector<RecentFile> RecentFiles(size_t n) {
     std::vector<RecentFile> out;
     PWSTR dir = nullptr;
