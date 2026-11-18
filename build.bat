@@ -105,7 +105,7 @@ exit /b 1
 if not exist out mkdir out
 rc /nologo /fo out\skyline.res src\skyline.rc || exit /b 1
 cl /nologo /std:c++20 /O2 /EHsc /MT /utf-8 /W3 /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 /DNTDDI_VERSION=0x0A00000C /DNOMINMAX ^
-  src\main.cpp src\bar.cpp src\tray.cpp src\status.cpp src\menus.cpp src\dock.cpp src\tiling.cpp src\settings.cpp src\icons.cpp src\hotcorners.cpp src\preview.cpp src\applist.cpp src\startmenu.cpp src\nowplaying.cpp src\garden.cpp src\update.cpp src\dialog.cpp src\backup.cpp src\filesearch.cpp src\flyouts.cpp src\look.cpp src\mission.cpp src\systheme.cpp src\writing.cpp ^
+  src\main.cpp src\bar.cpp src\tray.cpp src\status.cpp src\menus.cpp src\dock.cpp src\tiling.cpp src\enhancedtiling.cpp src\deskclock.cpp src\settings.cpp src\icons.cpp src\hotcorners.cpp src\preview.cpp src\applist.cpp src\startmenu.cpp src\nowplaying.cpp src\garden.cpp src\update.cpp src\dialog.cpp src\backup.cpp src\filesearch.cpp src\flyouts.cpp src\look.cpp src\mission.cpp src\systheme.cpp src\writing.cpp ^
   out\skyline.res /Fo:out\ /Fe:%OUTEXE% ^
   /link /SUBSYSTEM:WINDOWS /ENTRY:wWinMainCRTStartup /MANIFEST:NO ^
   d2d1.lib dwrite.lib windowscodecs.lib dwmapi.lib shcore.lib shlwapi.lib shell32.lib ole32.lib oleaut32.lib ^

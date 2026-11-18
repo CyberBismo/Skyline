@@ -15,6 +15,8 @@
 #include "garden.h"
 #include "applist.h"
 #include "tiling.h"
+#include "enhancedtiling.h"
+#include "deskclock.h"
 #include "hotcorners.h"
 #include "update.h"
 #include <shellscalingapi.h>
@@ -373,6 +375,7 @@ Settings LoadSettings() {
             s.cornerAction[i] = std::clamp((int)GetPrivateProfileIntW(L"HotCorners", keys[i], i == 0 ? 1 : 0, p), 0, HotCorners::kActions - 1);
     }
     s.tilingEnabled = GetPrivateProfileIntW(L"Tiling", L"Enabled", 0, p) != 0;
+    s.enhancedTiling = GetPrivateProfileIntW(L"Tiling", L"Enhanced", 0, p) != 0;
     s.tilingLayout = std::clamp((int)GetPrivateProfileIntW(L"Tiling", L"Layout", 0, p), 0, 3);
     s.tilingGap = std::clamp((int)GetPrivateProfileIntW(L"Tiling", L"Gap", 8, p), 0, 40);
     s.tilingDockSpace = GetPrivateProfileIntW(L"Tiling", L"DockSpace", 1, p) != 0;
@@ -990,7 +993,7 @@ void App::UpdateForeground(HWND h) {
 static bool CoversMonitor(HWND f, HMONITOR* monOut) {
     if (!f || !IsWindowVisible(f) || IsIconic(f) || g_app.IsOurWindow(f)) return false;
     // A window the tiler placed is an ordinary window, even when it fills the screen (no gaps).
-    if (g_app.tiler && g_app.tiler->Manages(f)) return false;
+    if ((g_app.tiler && g_app.tiler->Manages(f)) || EnhancedManages(f)) return false;
     wchar_t cls[64] = {};
     GetClassNameW(f, cls, 64);
     if (!lstrcmpW(cls, L"Progman") || !lstrcmpW(cls, L"WorkerW") || !lstrcmpW(cls, L"Shell_TrayWnd")) return false;
@@ -1064,6 +1067,7 @@ static void CheckFullscreen() {
         for (auto& b : g_app.bars) b->FlushPending();
         for (auto& d : g_app.docks) d->FlushPending();
         if (g_app.tiler) g_app.tiler->FlushPending();
+        EnhancedFlushPending();
     }
 }
 
@@ -1115,6 +1119,9 @@ static void WatchForegroundMoves(HWND h) {
 
 static void CALLBACK ForegroundHook(HWINEVENTHOOK, DWORD, HWND h, LONG idObj, LONG, DWORD, DWORD) {
     if (idObj != OBJID_WINDOW) return;
+    static HWND prevFg = nullptr;   // the window that just lost focus is still on screen: keep a fresh picture of it
+    if (g_app.settings.dockMinimize && prevFg && prevFg != h && IsWindow(prevFg) && !IsIconic(prevFg)) EnhancedSnapshotKick(prevFg, false);
+    prevFg = h;
     WatchForegroundMoves(h);
     bool winStart = IsWindowsStart(h);
     if (winStart != g_winStart) { g_winStart = winStart; StartChanged(); }
@@ -1281,6 +1288,15 @@ static LRESULT CALLBACK CtlProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case 0x7110:   // tiling debounce
             if (g_app.tiler) g_app.tiler->OnTimer();
             break;
+        case 0x7112:   // Enhanced Tiling debounce
+            EnhancedTimer();
+            break;
+        case 0x7113:   // Enhanced Tiling window glide
+            EnhancedAnimTimer();
+            break;
+        case 0x7114:   // Enhanced Tiling focus follows mouse
+            EnhancedFocusTimer();
+            break;
         case kTimerFullscreen:
             KillTimer(h, kTimerFullscreen);
             CheckFullscreen();
@@ -1316,6 +1332,7 @@ static LRESULT CALLBACK CtlProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_HOTKEY:
         if ((int)wp == StartMenus::kSpotlightHotkey) { StartMenus::ToggleSpotlight(); return 0; }
         if ((int)wp == WritingTools::kHotkeyId) { WritingTools::OnHotkey(); return 0; }
+        if (EnhancedHotkey((int)wp)) return 0;
         if (g_app.tiler) g_app.tiler->OnHotkey((int)wp);
         return 0;
     case WM_SKY_STATUS:
@@ -1344,7 +1361,8 @@ static LRESULT CALLBACK CtlProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 g_app.tray.reset();
                 g_app.InvalidateAll();
             }
-            if (g_app.tiler) g_app.tiler->ApplySettings();
+            EnhancedApply();
+            DeskClockApply();
             WritingTools::ApplyHotkey();
             g_app.ApplyHotCorners();
             ApplyStartAlignment(g_app.settings.centerStart);
@@ -1467,7 +1485,8 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int) {
     g_fgHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, ForegroundHook, 0, 0,
                                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     g_app.tiler = std::make_unique<Tiler>();
-    g_app.tiler->ApplySettings();
+    EnhancedApply();
+    DeskClockApply();
     g_app.ApplyHotCorners();
     ApplyStartAlignment(g_app.settings.centerStart);
     StartMenus::ApplySettings();
@@ -1497,6 +1516,7 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE, PWSTR, int) {
     NowPlaying::Shutdown();
     Garden::Shutdown();
     ApplyStartAlignment(false);   // give the user's own Start position back
+    EnhancedShutdown();
     if (g_app.tiler) {
         g_app.tiler->Stop();
         g_app.settings.tilingMode = 0;

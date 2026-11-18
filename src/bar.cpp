@@ -7,6 +7,7 @@
 #include "menus.h"
 #include "dock.h"
 #include "tiling.h"
+#include "enhancedtiling.h"
 #include "settings.h"
 #include "icons.h"
 #include "nowplaying.h"
@@ -524,6 +525,7 @@ bool Bar::CreateResources() {
     mk(fBold_, TextFontName(), DWRITE_FONT_WEIGHT_SEMI_BOLD, 12.5f, false);
     mk(fText_, TextFontName(), DWRITE_FONT_WEIGHT_NORMAL, 12.5f, false);
     mk(fIcon_, IconFontName(), DWRITE_FONT_WEIGHT_NORMAL, 15.0f, true);
+    mk(fNum_, TextFontName(), DWRITE_FONT_WEIGHT_SEMI_BOLD, 11.0f, true);
 
     // Ellipsis for long window names
     if (fBold_) {
@@ -623,6 +625,12 @@ void Bar::Layout(float W, float H) {
     if (g_app.settings.tilingButton) {
         items_.push_back({Kind::Tiling, D2D1::RectF(x - 28, padV, x, H - padV)});
         x -= 28 + 4;
+    }
+    if (EnhancedSpacesAvailable()) {
+        spacesIcon_ = GetPrivateProfileIntW(L"Tiling", L"SpacesIcon", 1, g_app.settings.path.c_str()) == 2 ? 2 : 1;
+        // Enhanced Tiling: the four workspaces as dots (the lit one is where you are)
+        items_.push_back({Kind::Spaces, D2D1::RectF(x - 36, padV, x, H - padV)});
+        x -= 36 + 4;
     }
 
     if (primary_ && g_app.tray && g_app.settings.trayEnabled) {
@@ -862,7 +870,7 @@ void Bar::Paint() {
             DrawStatus(it.rc);
             break;
         case Kind::Tiling: {
-            bool on = g_app.tiler && g_app.tiler->Running();
+            bool on = TilingRunning();
             float cx = (it.rc.left + it.rc.right) / 2, cyy = (it.rc.top + it.rc.bottom) / 2;
             // Four tiles: filled in accent when tiling is on, outlined when off
             float s = 5.2f, g = 1.6f;
@@ -874,6 +882,52 @@ void Bar::Paint() {
                     if (on) rt_->FillRoundedRectangle(rr, brush_.Get());
                     else rt_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(l + 0.5f, t + 0.5f, l + s - 0.5f, t + s - 0.5f), 1.2f, 1.2f), brush_.Get(), 1.0f);
                 }
+            break;
+        }
+        case Kind::Spaces: {
+            float cx = std::floor((it.rc.left + it.rc.right) / 2), cyy = std::floor((it.rc.top + it.rc.bottom) / 2);
+            if (spacesIcon_ == 2) {   // a little screen with the number of the workspace you are on
+                D2D1_RECT_F r = D2D1::RectF(cx - 10.5f, cyy - 8, cx + 10.5f, cyy + 4.5f);
+                brush_->SetColor(th.fgDim);
+                rt_->DrawRoundedRectangle(D2D1::RoundedRect(r, 2.5f, 2.5f), brush_.Get(), 1.4f);
+                rt_->DrawLine(D2D1::Point2F(cx - 4, cyy + 8), D2D1::Point2F(cx + 4, cyy + 8), brush_.Get(), 1.4f);
+                if (fNum_) {
+                    std::wstring n = std::to_wstring(EnhancedCurrentSpace(mon_));
+                    brush_->SetColor(th.accent);
+                    rt_->DrawTextW(n.c_str(), (UINT32)n.size(), fNum_.Get(), D2D1::RectF(r.left, r.top, r.right, r.bottom + 1), brush_.Get());
+                }
+                break;
+            }
+            // three screens stacked behind each other; the front one carries the accent colour.
+            // The two behind are drawn as open "L" shapes so the bar shows through (no filled boxes).
+            const float w = 15, h = 10, st = 3.5f, rad = 2.5f;
+            float x0 = cx - (w + 2 * st) / 2, y0 = cyy - (h + 2 * st) / 2;
+            for (int i = 0; i < 3; ++i) {
+                float l = std::floor(x0 + (2 - i) * st) + 0.5f, t = std::floor(y0 + i * st) + 0.5f, r = l + w, b = t + h;
+                if (i == 2) {
+                    brush_->SetColor(th.accent);
+                    rt_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(l, t, r, b), rad, rad), brush_.Get(), 1.4f);
+                    continue;
+                }
+                ComPtr<ID2D1PathGeometry> pg;
+                ComPtr<ID2D1GeometrySink> sk;
+                if (FAILED(g_gfx.d2d->CreatePathGeometry(pg.Put())) || FAILED(pg->Open(sk.Put()))) continue;
+                auto arc = [&](float x, float y) { sk->AddArc(D2D1::ArcSegment(D2D1::Point2F(x, y), D2D1::SizeF(rad, rad), 0, D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL)); };
+                sk->BeginFigure(D2D1::Point2F(l, t + st), D2D1_FIGURE_BEGIN_HOLLOW);
+                sk->AddLine(D2D1::Point2F(l, t + rad));
+                arc(l + rad, t);
+                sk->AddLine(D2D1::Point2F(r - rad, t));
+                arc(r, t + rad);
+                sk->AddLine(D2D1::Point2F(r, b - rad));
+                arc(r - rad, b);
+                sk->AddLine(D2D1::Point2F(r - st, b));
+                sk->EndFigure(D2D1_FIGURE_END_OPEN);
+                sk->Close();
+                D2D1_COLOR_F c = th.fg;
+                c.a = i == 0 ? 0.38f : 0.6f;
+                brush_->SetColor(c);
+                rt_->DrawGeometry(pg.Get(), brush_.Get(), 1.4f);
+            }
             break;
         }
         case Kind::Clock:
@@ -1056,8 +1110,10 @@ std::wstring Bar::TooltipFor(const Item& it) {
         if (t->version > 3 && !t->showTip) return L"";
         return t->tip;
     }
+    case Kind::Spaces:
+        return std::wstring(TR(L"Arbeidsområde ", L"Workspace ")) + std::to_wstring(EnhancedCurrentSpace(mon_)) + TR(L" av 4\nKlikk for oversikt · Ctrl+Alt+1–4 bytter", L" of 4\nClick for the overview · Ctrl+Alt+1–4 switches");
     case Kind::Tiling: {
-        bool on = g_app.tiler && g_app.tiler->Running();
+        bool on = TilingRunning();
         return std::wstring(on ? TR(L"Tiling: på", L"Tiling: on") : TR(L"Tiling: av", L"Tiling: off")) + TR(L"\nKlikk for å slå av/på · Høyreklikk for innstillinger", L"\nClick to toggle · Right-click for settings");
     }
     case Kind::Status: {
@@ -1258,12 +1314,12 @@ void Bar::ShowAppMenu(const Item& it) {
     AppendMenuW(m, MF_STRING | dis, CmdMin, TR(L"Minimer", L"Minimize"));
     AppendMenuW(m, MF_STRING | dis, CmdMax, valid && IsZoomed(target) ? TR(L"Gjenopprett", L"Restore") : TR(L"Maksimer", L"Maximize"));
     AppendMenuW(m, MF_STRING | dis, CmdClose, TR(L"Lukk vindu", L"Close Window"));
-    bool tiling = g_app.tiler && g_app.tiler->Running();
+    bool tiling = TilingRunning();
     std::wstring exe = g_app.fg.exe;
     bool never = std::find(g_app.settings.tilingFloat.begin(), g_app.settings.tilingFloat.end(), exe) != g_app.settings.tilingFloat.end();
     if (tiling && valid) {
         AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(m, MF_STRING | (g_app.tiler->IsFloating(target) ? MF_CHECKED : 0), CmdFloatWin, TR(L"Flytende vindu (ikke tile)", L"Floating window (don't tile)"));
+        AppendMenuW(m, MF_STRING | (TilingIsFloating(target) ? MF_CHECKED : 0), CmdFloatWin, TR(L"Flytende vindu (ikke tile)", L"Floating window (don't tile)"));
         std::wstring label = TR(L"Aldri tile ", L"Never tile ") + g_app.fg.name;
         AppendMenuW(m, MF_STRING | (never ? MF_CHECKED : 0), CmdNeverTile, label.c_str());
     }
@@ -1307,13 +1363,13 @@ void Bar::ShowAppMenu(const Item& it) {
     case CmdAutostart: SetAutostart(!AutostartEnabled()); break;
     case CmdSettings: ShowSettings(SettingsPage::General); return;
     case CmdUpdate: Update::Install(); return;
-    case CmdFloatWin: if (valid && g_app.tiler) g_app.tiler->ToggleFloat(target); break;
+    case CmdFloatWin: if (valid) TilingToggleFloat(target); break;
     case CmdNeverTile: {
         auto& f = g_app.settings.tilingFloat;
         if (never) f.erase(std::remove(f.begin(), f.end(), exe), f.end());
         else if (!exe.empty()) f.push_back(exe);
         IniWrite(L"Tiling", L"Float", JoinList(f, L", "));
-        if (g_app.tiler) g_app.tiler->Schedule(10);
+        TilingSchedule(10);
         SettingsChanged();
         break;
     }
@@ -1511,11 +1567,15 @@ void Bar::OnButton(UINT msg, POINT client) {
             else if (msg == WM_MBUTTONUP) { g_app.status->ToggleMute(); g_app.InvalidateAll(); }
             else if (msg == WM_RBUTTONUP) ShellExecuteW(nullptr, L"open", L"ms-settings:sound", nullptr, nullptr, SW_SHOWNORMAL);
             break;
+        case Kind::Spaces:
+            if (msg == WM_LBUTTONUP) EnhancedSpacesToggle(mon_);
+            else if (msg == WM_RBUTTONUP) ShowSettings(SettingsPage::Tiling);
+            break;
         case Kind::Tiling:
             if (msg == WM_LBUTTONUP) {
                 g_app.settings.tilingEnabled = !g_app.settings.tilingEnabled;
                 IniWrite(L"Tiling", L"Enabled", g_app.settings.tilingEnabled ? 1 : 0);
-                if (g_app.tiler) g_app.tiler->ApplySettings();
+                EnhancedApply();
                 g_app.InvalidateAll();
                 UpdateTooltip();
                 SettingsChanged();

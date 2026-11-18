@@ -27,7 +27,7 @@ public:
     bool Primary() const { return primary_; }
 
 private:
-    enum class Kind { App, Menu, Tray, Tiling, Status, Clock, Media };
+    enum class Kind { App, Menu, Tray, Tiling, Spaces, Status, Clock, Media };
     struct Item {
         Kind kind;
         D2D1_RECT_F rc;          // DIPs, client space
@@ -122,7 +122,8 @@ private:
 
     ComPtr<ID2D1HwndRenderTarget> rt_;
     ComPtr<ID2D1SolidColorBrush> brush_;
-    ComPtr<IDWriteTextFormat> fBold_, fText_, fIcon_;
+    ComPtr<IDWriteTextFormat> fBold_, fText_, fIcon_, fNum_;
+    int spacesIcon_ = 1;   // workspace button look: 1 = stacked screens, 2 = screen with the number
     ComPtr<IDWriteTextLayout> appLayout_, clockLayout_;
     std::vector<ComPtr<IDWriteTextLayout>> menuLayouts_;
     ComPtr<ID2D1Bitmap> appBmp_;

@@ -7,6 +7,8 @@
 #include "writing.h"
 #include "app.h"
 #include "tiling.h"
+#include "enhancedtiling.h"
+#include "deskclock.h"
 #include "dock.h"
 #include "bar.h"
 #include "startmenu.h"
@@ -156,7 +158,7 @@ std::wstring IniPathOf() { return g_app.settings.path; }
 void FullReload() { PostMessageW(g_app.ctlWnd, WM_SKY_STATUS, 2, 0); }
 
 void TilingApply() {
-    if (g_app.tiler) g_app.tiler->ApplySettings();
+    EnhancedApply();
     g_app.InvalidateAll();
 }
 
@@ -646,6 +648,27 @@ void SettingsWindow::BuildPage(SettingsPage pg) {
         toggle(TR(L"Automatisk tiling", L"Automatic tiling"), TR(L"Vinduer ordner seg selv når de åpnes, lukkes eller minimeres", L"Windows arrange themselves when opened, closed or minimized"),
                [&s] { return s.tilingEnabled; },
                [&s](bool v) { s.tilingEnabled = v; IniWrite(L"Tiling", L"Enabled", v ? 1 : 0); TilingApply(); });
+        toggle(L"Enhanced Tiling", TR(L"Egen tiling-motor: levende størrelsesendring, hurtigtaster for størrelse og regler per app. Bruker sitt eget oppsett (BSP), så «Oppsett» under gjelder ikke.", L"Its own tiling engine: live resizing, size shortcuts and per-app rules. Uses its own layout (BSP), so \u201cLayout\u201d below does not apply."),
+               [&s] { return s.enhancedTiling; },
+               [this, &s](bool v) { s.enhancedTiling = v; IniWrite(L"Tiling", L"Enhanced", v ? 1 : 0); TilingApply(); Rebuild(); });
+        if (s.enhancedTiling) {
+            toggle(TR(L"Skillelinjer", L"Dividers"), TR(L"Grip og dra mellom vinduene for å endre størrelse (dobbeltklikk = lik størrelse). Trenger litt avstand mellom vinduene.", L"Grab and drag between windows to resize (double-click = equal size). Needs a small gap between windows."),
+                   [] { return GetPrivateProfileIntW(L"Tiling", L"Dividers", 1, IniPathOf().c_str()) != 0; },
+                   [](bool v) { IniWrite(L"Tiling", L"Dividers", v ? 1 : 0); TilingApply(); });
+            toggle(TR(L"Dra for å snappe", L"Drag to snap"), TR(L"Dra et vindu mot kanten av et annet: forhåndsvisning vises, og slipper du der deler det plassen. Midten bytter plass.", L"Drag a window to the edge of another: a preview shows, and dropping there splits that window's space. The middle swaps places."),
+                   [] { return GetPrivateProfileIntW(L"Tiling", L"Snap", 1, IniPathOf().c_str()) != 0; },
+                   [](bool v) { IniWrite(L"Tiling", L"Snap", v ? 1 : 0); TilingApply(); });
+            choice(TR(L"Ikon i topplinja", L"Top bar icon"), TR(L"Hvordan arbeidsområde-knappen ser ut.", L"How the workspace button looks."),
+                   {TR(L"Stablede skjermer", L"Stacked screens"), TR(L"Skjerm med tall", L"Screen with number")},
+                   [] { return GetPrivateProfileIntW(L"Tiling", L"SpacesIcon", 1, IniPathOf().c_str()) == 2 ? 1 : 0; },
+                   [this](int v) { IniWrite(L"Tiling", L"SpacesIcon", v == 1 ? 2 : 1); ScheduleApply(); });
+            toggle(TR(L"Animasjon", L"Animation"), TR(L"Vinduene glir til ny plass (ca. 0,14 sekunder) i stedet for å hoppe.", L"Windows glide to their new place (about 0.14 s) instead of jumping."),
+                   [] { return GetPrivateProfileIntW(L"Tiling", L"Animate", 1, IniPathOf().c_str()) != 0; },
+                   [](bool v) { IniWrite(L"Tiling", L"Animate", v ? 1 : 0); TilingApply(); });
+            toggle(TR(L"Fokus følger musa", L"Focus follows mouse"), TR(L"Vinduet under musepekeren får fokus uten klikk. Gjelder bare mellom flisede vinduer.", L"The window under the pointer gets focus without a click. Only between tiled windows."),
+                   [] { return GetPrivateProfileIntW(L"Tiling", L"FocusFollowsMouse", 0, IniPathOf().c_str()) != 0; },
+                   [](bool v) { IniWrite(L"Tiling", L"FocusFollowsMouse", v ? 1 : 0); TilingApply(); });
+        }
         choice(TR(L"Oppsett", L"Layout"), nullptr,
                {TR(L"BSP – deler skjermen i to, igjen og igjen", L"BSP – splits the screen in two, again and again"), TR(L"Master – ett stort + stabel", L"Master – one large + stack"), TR(L"Kolonner", L"Columns"),
                 TR(L"Monocle – ett vindu om gangen", L"Monocle – one window at a time")},
@@ -662,15 +685,25 @@ void SettingsWindow::BuildPage(SettingsPage pg) {
                [&s](bool v) { s.tilingDockSpace = v; IniWrite(L"Tiling", L"DockSpace", v ? 1 : 0); TilingApply(); });
         button(TR(L"Feilsøkingsfil", L"Debug file"), TR(L"Skriver skyline-debug.txt ved siden av skyline.ini (skjermer, topplinje, vinduer). Hurtigtast: Ctrl + Alt + D", L"Writes skyline-debug.txt next to skyline.ini (screens, bar, windows). Shortcut: Ctrl + Alt + D"),
                TR(L"Skriv nå", L"Write now"), [] { if (g_app.tiler) g_app.tiler->DebugDump(); });
+        if (s.enhancedTiling)
+            info(TR(L"Regler per app", L"Per-app rules"), TR(L"Skriv i skyline.ini under [Tiling]: Rules=firefox.exe=float, code.exe=monitor 2, spotify.exe=space 3 (flytende, skjerm 2, arbeidsområde 3). Gjelder nye vinduer.", L"In skyline.ini under [Tiling]: Rules=firefox.exe=float, code.exe=monitor 2, spotify.exe=space 3 (floating, screen 2, workspace 3). Applies to new windows."));
         info(TR(L"Bytt plass med musen", L"Swap with the mouse"), TR(L"Dra et vindu og slipp det oppå et annet, så bytter de plass.", L"Drag a window and drop it onto another to swap them."));
         if (s.tilingMode >= 1) {
             header(TR(L"Hurtigtaster", L"Keyboard shortcuts"));
-            info(L"Ctrl + Alt + T", TR(L"Slå tiling av og på", L"Turn tiling on and off"));
+            if (!s.enhancedTiling) info(L"Ctrl + Alt + T", TR(L"Slå tiling av og på", L"Turn tiling on and off"));
             info(TR(L"Ctrl + Alt + piltaster", L"Ctrl + Alt + arrow keys"), TR(L"Flytt fokus til vinduet ved siden av", L"Move focus to the adjacent window"));
             info(TR(L"Ctrl + Alt + Shift + piltaster", L"Ctrl + Alt + Shift + arrow keys"), TR(L"Bytt plass med vinduet ved siden av", L"Swap with the adjacent window"));
             info(L"Ctrl + Alt + F", TR(L"Gjør vinduet flytende / tile det igjen", L"Float the window / tile it again"));
             info(L"Ctrl + Alt + L", TR(L"Neste oppsett", L"Next layout"));
             info(TR(L"Ctrl + Alt + Mellomrom", L"Ctrl + Alt + Space"), TR(L"Ordne vinduene nå", L"Arrange windows now"));
+            if (s.enhancedTiling) {
+                info(TR(L"Ctrl + Alt + Win + piltaster", L"Ctrl + Alt + Win + arrow keys"), TR(L"Flytt skillelinjen nærmest vinduet (hold inne for å fortsette)", L"Move the divider nearest the window (hold to keep going)"));
+                info(L"Ctrl + Alt + Win + E", TR(L"Lik størrelse på alle vinduene", L"Equal size for all windows"));
+                info(TR(L"Ctrl + Alt + Enter", L"Ctrl + Alt + Enter"), TR(L"Gjør vinduet til hovedvindu (første plass)", L"Make the window the main window (first place)"));
+                info(L"Ctrl + Alt + 1–8", TR(L"Bytt til arbeidsområde 1–8 på skjermen med musa", L"Go to workspace 1–8 on the screen the mouse is on"));
+                info(L"Ctrl + Alt + Shift + 1–8", TR(L"Send vinduet til arbeidsområde 1–8", L"Send the window to workspace 1–8"));
+                info(L"Ctrl + Alt + O", TR(L"Vis alle arbeidsområder (oversikt)", L"Show all workspaces (overview)"));
+            }
         }
         header(TR(L"Apper som aldri tiles", L"Apps that are never tiled"));
         if (s.tilingFloat.empty()) {
@@ -869,6 +902,24 @@ void SettingsWindow::BuildPage(SettingsPage pg) {
                     L"The text you select is sent to the service you choose. Gemini's free tier may use it to improve Google's models. "
                     L"With Ollama everything stays on this PC. The key is stored encrypted by Windows and isn't included in backup files."));
         }
+        header(TR(L"Skrivebordsklokke", L"Desktop clock"));
+        toggle(TR(L"Klokke på skrivebordet", L"Clock on the desktop"), TR(L"En stor, gjennomsiktig klokke med dato bak alle vinduer.", L"A big, see-through clock with the date, behind all windows."),
+               [] { return GetPrivateProfileIntW(L"DeskClock", L"Enabled", 0, IniPathOf().c_str()) != 0; },
+               [](bool v) { IniWrite(L"DeskClock", L"Enabled", v ? 1 : 0); DeskClockApply(); });
+        {
+            std::vector<std::wstring> mons{TR(L"Hovedskjermen", L"Main screen")};
+            for (int mi = 1; mi <= DeskClockMonitorCount(); ++mi) mons.push_back(TR(L"Skjerm ", L"Screen ") + std::to_wstring(mi));
+            choice(TR(L"Skjerm", L"Screen"), TR(L"Hvilken skjerm klokka ligger på.", L"Which screen the clock sits on."), mons,
+                   [] { return (int)GetPrivateProfileIntW(L"DeskClock", L"Monitor", 0, IniPathOf().c_str()); },
+                   [](int v) { IniWrite(L"DeskClock", L"Monitor", v); DeskClockApply(); });
+        }
+        choice(TR(L"Plassering", L"Position"), nullptr,
+               {TR(L"Midten", L"Centre"), TR(L"Oppe til venstre", L"Top left"), TR(L"Oppe til høyre", L"Top right"), TR(L"Nede til venstre", L"Bottom left"), TR(L"Nede til høyre", L"Bottom right")},
+               [] { return (int)GetPrivateProfileIntW(L"DeskClock", L"Position", 0, IniPathOf().c_str()); },
+               [](int v) { IniWrite(L"DeskClock", L"Position", v); DeskClockApply(); });
+        choice(TR(L"Størrelse", L"Size"), nullptr, {TR(L"Liten", L"Small"), TR(L"Middels", L"Medium"), TR(L"Stor", L"Large")},
+               [] { return (int)GetPrivateProfileIntW(L"DeskClock", L"Size", 1, IniPathOf().c_str()); },
+               [](int v) { IniWrite(L"DeskClock", L"Size", v); DeskClockApply(); });
         header(L"Mission Control");
         toggle(L"Mission Control",
                TR(L"Alle vinduene på skjermen side om side, levende. Vinduene glir ut i et rutenett og tilbake; klikk ett for å gå dit, Esc for å gå tilbake.",
