@@ -131,11 +131,76 @@ bool IsExe(const std::wstring& t) {
 } // namespace
 
 // ---------------------------------------------------------------------------
+// Icons without a working alpha channel (old-style icons with only a mask, or 32-bit icons whose alpha is all zero)
+// come out of WIC fully transparent: invisible. Draw such an icon the way Windows does, on black and on white, and
+// work out each pixel's transparency from the difference.
+static ComPtr<IWICBitmap> IconViaGdi(HICON icon) {
+    ComPtr<IWICBitmap> out;
+    ICONINFO ii{};
+    if (!GetIconInfo(icon, &ii)) return out;
+    BITMAP bm{};
+    int w = 0, h = 0;
+    if (ii.hbmColor && GetObjectW(ii.hbmColor, sizeof bm, &bm)) { w = bm.bmWidth; h = bm.bmHeight; }
+    else if (ii.hbmMask && GetObjectW(ii.hbmMask, sizeof bm, &bm)) { w = bm.bmWidth; h = bm.bmHeight / 2; }
+    if (ii.hbmColor) DeleteObject(ii.hbmColor);
+    if (ii.hbmMask) DeleteObject(ii.hbmMask);
+    if (w <= 0 || h <= 0 || w > 512 || h > 512) return out;
+    BITMAPINFO bi{};
+    bi.bmiHeader = {sizeof(BITMAPINFOHEADER), w, -h, 1, 32, BI_RGB};
+    HDC dc = CreateCompatibleDC(nullptr);
+    void *pb = nullptr, *pw = nullptr;
+    HBITMAP b = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &pb, nullptr, 0);
+    HBITMAP wh = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &pw, nullptr, 0);
+    if (b && wh && pb && pw) {
+        HGDIOBJ old = SelectObject(dc, b);
+        memset(pb, 0, (size_t)w * h * 4);
+        DrawIconEx(dc, 0, 0, icon, w, h, 0, nullptr, DI_NORMAL);
+        SelectObject(dc, wh);
+        memset(pw, 0xFF, (size_t)w * h * 4);
+        DrawIconEx(dc, 0, 0, icon, w, h, 0, nullptr, DI_NORMAL);
+        SelectObject(dc, old);
+        GdiFlush();
+        std::vector<BYTE> px((size_t)w * h * 4);
+        const BYTE *k = (const BYTE*)pb, *wt = (const BYTE*)pw;
+        for (size_t i = 0; i < (size_t)w * h; ++i) {
+            // on black we see c*a, on white c*a + 255*(1-a): the difference is 255*(1-a)
+            int a = std::clamp(255 - ((wt[i * 4] - k[i * 4]) + (wt[i * 4 + 1] - k[i * 4 + 1]) + (wt[i * 4 + 2] - k[i * 4 + 2])) / 3, 0, 255);
+            px[i * 4] = std::min<int>(k[i * 4], a);   // premultiplied: the colour on black is already c*a
+            px[i * 4 + 1] = std::min<int>(k[i * 4 + 1], a);
+            px[i * 4 + 2] = std::min<int>(k[i * 4 + 2], a);
+            px[i * 4 + 3] = (BYTE)a;
+        }
+        Wic()->CreateBitmapFromMemory(w, h, GUID_WICPixelFormat32bppPBGRA, w * 4, (UINT)px.size(), px.data(), out.Put());
+    }
+    if (b) DeleteObject(b);
+    if (wh) DeleteObject(wh);
+    DeleteDC(dc);
+    return out;
+}
+
+// Does the picture have anything visible in it?
+static bool AnyAlpha(IWICBitmapSource* src) {
+    ComPtr<IWICFormatConverter> conv;
+    if (FAILED(Wic()->CreateFormatConverter(conv.Put())) ||
+        FAILED(conv->Initialize(src, GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom)))
+        return true;   // can't tell: trust it
+    UINT w = 0, h = 0;
+    conv->GetSize(&w, &h);
+    if (!w || !h || w > 512 || h > 512) return true;
+    std::vector<BYTE> px((size_t)w * h * 4);
+    if (FAILED(conv->CopyPixels(nullptr, w * 4, (UINT)px.size(), px.data()))) return true;
+    for (size_t i = 3; i < px.size(); i += 4) if (px[i]) return true;
+    return false;
+}
+
 ComPtr<IWICBitmapSource> ImageFromIcon(HICON icon, int px) {
     ComPtr<IWICBitmapSource> out;
     if (!icon || !Wic()) return out;
     ComPtr<IWICBitmap> wb;
-    if (FAILED(Wic()->CreateBitmapFromHICON(icon, wb.Put()))) return out;
+    if (FAILED(Wic()->CreateBitmapFromHICON(icon, wb.Put())) || !AnyAlpha(wb.Get())) {
+        wb = IconViaGdi(icon);   // no alpha to speak of: build it from the mask, as Windows does
+        if (!wb) return out;
+    }
     return Finish(wb.Get(), px);
 }
 

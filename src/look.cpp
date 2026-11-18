@@ -17,7 +17,7 @@ const Key kMat[] = {{L"Bar", L"Material"}, {L"Dock", L"Material"}, {L"Start", L"
                     {L"Garden", L"Material"}, {L"Spotlight", L"Material"}, {L"Vibe", L"Material"}, {L"Flyouts", L"Material"}};
 const Key kTint[] = {{L"Bar", L"BarTint"}, {L"Bar", L"Tint"}, {L"Start", L"Tint"}, {L"Bar", L"CardTint"}, {L"NowPlaying", L"CardTint"},
                      {L"Garden", L"Tint"}, {L"Spotlight", L"Tint"}, {L"Vibe", L"Tint"}, {L"Flyouts", L"Tint"}};
-const Key kExtra[] = {{L"Look", L"LiquidGlass"}, {L"Look", L"Glassiness"}, {L"Look", L"Theme"}, {L"Look", L"Aurora"}};
+const Key kExtra[] = {{L"Look", L"LiquidGlass"}, {L"Look", L"Glassiness"}, {L"Look", L"Theme"}, {L"Look", L"Aurora"}, {L"Look", L"Tone"}};
 constexpr int kParts = 9;
 static_assert(sizeof kMat / sizeof kMat[0] == kParts && sizeof kTint / sizeof kTint[0] == kParts);
 
@@ -75,6 +75,11 @@ const wchar_t* ThemeName(int i) {
     case 3: return TR(L"Frostet", L"Frosted");
     case 4: return TR(L"Matt (minst ressurser)", L"Matte (lightest)");
     case 5: return TR(L"Nordlys (vibe coded)", L"Nordlys – northern lights (vibe coded)");
+    case 6: return TR(L"Midnatt (OLED-svart)", L"Midnight (OLED black)");
+    case 7: return TR(L"Hav", L"Ocean");
+    case 8: return TR(L"Solnedgang", L"Sunset");
+    case 9: return TR(L"Skog", L"Forest");
+    case 10: return TR(L"Rosé", L"Rosé");
     default: return TR(L"Standard (Skyline)", L"Standard (Skyline)");
     }
 }
@@ -106,6 +111,13 @@ void ApplyTheme(int theme) {
     case 5:   // Nordlys: night-blue glass, the lights painted on every part (see PaintLiquid)
         for (int i = 0; i < kParts; ++i) tint[i] = i >= 2 ? 72 : 60;
         break;
+    case 6:   // Midnight: almost black glass, high contrast (OLED screens)
+        for (int i = 0; i < kParts; ++i) tint[i] = i >= 2 ? 92 : 88;
+        break;
+    case 7: case 8: case 9: case 10:   // Ocean, Sunset, Forest, Rosé: coloured glass with its own accent
+        liquid = true;                 // a soft sheen suits the coloured glass
+        for (int i = 0; i < kParts; ++i) tint[i] = i >= 2 ? 80 : 70;
+        break;
     default: break;
     }
     for (int i = 0; i < kParts; ++i) {
@@ -114,6 +126,7 @@ void ApplyTheme(int theme) {
     }
     Write(kExtra[0], liquid ? L"1" : L"0");
     Write(kExtra[3], theme == 5 ? L"1" : L"0");
+    Write(kExtra[4], std::to_wstring(theme >= 6 && theme <= 10 ? theme - 5 : 0));   // the glass colour
     Write(kExtra[2], std::to_wstring(std::clamp(theme, 0, kThemes - 1)));
     Reload();
 }

@@ -263,8 +263,37 @@ void Bar::RegisterAppBar() {
 // stay below it. Sometimes Windows doesn't (seen with the classic style while the taskbar is
 // hidden): then title bars ended up under the bar. If the work area still includes our strip,
 // we set it ourselves. Checked when the bar moves and when Windows changes the work area.
+void Bar::FlushPending() {
+    if (GameMode() || fullscreenHidden_) return;
+    if (pendingRepos_) { pendingRepos_ = false; Reposition(); }
+    EnsureWorkArea();
+}
+
+std::wstring Bar::DebugLine() const {
+    wchar_t b[400];
+    RECT wr{};
+    if (hwnd_) GetWindowRect(hwnd_, &wr);
+    swprintf(b, 400, L"  bar: hwnd=%p visible=%d rect=(%ld,%ld,%ld,%ld) home=(%ld,%ld,%ld,%ld) reserved=%d autohide=%d fullscreenHidden=%d forcedWork=%d primary=%d\r\n",
+             (void*)hwnd_, hwnd_ ? IsWindowVisible(hwnd_) : 0, wr.left, wr.top, wr.right, wr.bottom, home_.left, home_.top, home_.right, home_.bottom,
+             ReservedBottom(), (int)g_app.settings.barAutohide, (int)fullscreenHidden_, (int)forcedWork_, (int)primary_);
+    return b;
+}
+
 void Bar::EnsureWorkArea() {
+    if (hwnd_ && g_app.settings.barAutohide && primary_ && !staleChecked_ && !fullscreenHidden_ && !GameMode()) {
+        // Auto-hide reserves nothing. A reservation left over from before (e.g. Skyline was ended without giving the strip back)
+        // would keep maximized windows and the tiling away from the top, so give the top back once.
+        staleChecked_ = true;
+        MONITORINFO mi{sizeof mi};
+        if (GetMonitorInfoW(mon_, &mi) && mi.rcWork.top > mi.rcMonitor.top) {
+            RECT w = mi.rcWork;
+            w.top = mi.rcMonitor.top;
+            SystemParametersInfoW(SPI_SETWORKAREA, 0, &w, SPIF_SENDCHANGE);
+        }
+    }
     if (!hwnd_ || g_app.settings.barAutohide) return;
+    // Never during a game: setting the work area tells every window (the game too) that the screen changed
+    if (fullscreenHidden_ || GameMode()) return;
     int need = ReservedBottom();
     MONITORINFO mi{sizeof mi};
     if (!need || !GetMonitorInfoW(mon_, &mi) || mi.rcWork.top >= need) return;
@@ -377,7 +406,11 @@ void Bar::SetShown(bool s) {
     slideTarget_ = s ? 0.0f : 1.0f;
     if (s) {
         if (trigger_) ShowWindow(trigger_, SW_HIDE);
-        if (!fullscreenHidden_) ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+        if (!fullscreenHidden_) {
+            ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+            SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);   // in front of the windows, not behind
+            KeepOnTop();
+        }
         SetTimer(hwnd_, T_AUTOHIDE, 1200, nullptr);   // in case the mouse never comes in
     } else {
         POINT none{-1, -1};
@@ -419,6 +452,7 @@ LRESULT CALLBACK Bar::TriggerProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 void Bar::OnAppBarNotify(WPARAM wp, LPARAM lp) {
     switch (wp) {
     case ABN_POSCHANGED:
+        if (fullscreenHidden_ || GameMode()) { pendingRepos_ = true; break; }   // not in the middle of a game
         Reposition();
         break;
     case ABN_FULLSCREENAPP:
@@ -436,6 +470,7 @@ void Bar::SetFullscreen(bool fs) {
         for (HWND p : panels_) ShowWindow(p, SW_HIDE);   // the islands' glass goes too
         if (trigger_) ShowWindow(trigger_, SW_HIDE);   // never pop up over a game
     } else if (shown_) {
+        if (pendingRepos_) { pendingRepos_ = false; Reposition(); }
         ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
         SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         SyncPanels();
@@ -446,6 +481,9 @@ void Bar::SetFullscreen(bool fs) {
 }
 
 void Bar::KeepOnTop() {
+    // The hover strip of an auto-hidden bar must stay above a maximized window too (the bar itself is hidden then)
+    if (trigger_ && !fullscreenHidden_ && !shown_ && IsWindowVisible(trigger_))
+        SetWindowPos(trigger_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
     if (!hwnd_ || fullscreenHidden_ || inMenu_ || !IsWindowVisible(hwnd_)) return;
     SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
     for (HWND p : panels_)   // the glass islands sit right under the bar
@@ -758,7 +796,7 @@ void Bar::Paint() {
         const Item& it = items_[i];
         if (i == hover_ || i == pressed_ || i == menuOpen_) {
             brush_->SetColor(i == menuOpen_ ? th.hover : i == pressed_ ? th.press : th.hover);
-            rt_->FillRoundedRectangle(D2D1::RoundedRect(it.rc, 5, 5), brush_.Get());
+            rt_->FillRoundedRectangle(D2D1::RoundedRect(it.rc, 7, 7), brush_.Get());
         }
         float cy = (it.rc.top + it.rc.bottom) / 2;
 
@@ -792,15 +830,22 @@ void Bar::Paint() {
             break;
         case Kind::Tray: {
             TrayIcon* t = TrayFor(it);
-            if (!t || !t->icon) break;
+            if (!t) break;
             TrayBmp* cached = nullptr;
             for (auto& b : trayBmps_) if (b.hwnd == t->hwnd && b.uid == t->uid) { cached = &b; break; }
             if (!cached) { trayBmps_.push_back({t->hwnd, t->uid, 0, {}}); cached = &trayBmps_.back(); }
             if (!cached->bmp || cached->gen != t->iconGen) {
                 cached->bmp.Reset();
                 int px = (int)std::lround(16.0f * dpi_ / 96.0f);
-                if (auto img = ImageFromIcon(t->icon, px)) rt_->CreateBitmapFromWicBitmap(img.Get(), nullptr, cached->bmp.Put());
-                if (!cached->bmp) cached->bmp = BitmapFromIcon(rt_.Get(), t->icon);
+                if (t->icon) {
+                    if (auto img = ImageFromIcon(t->icon, px)) rt_->CreateBitmapFromWicBitmap(img.Get(), nullptr, cached->bmp.Put());
+                    if (!cached->bmp) cached->bmp = BitmapFromIcon(rt_.Get(), t->icon);
+                }
+                if (!cached->bmp && t->pid) {   // nothing usable from the app: its own exe icon, so it never goes invisible
+                    std::wstring exe = ProcessImagePath(t->pid);
+                    if (!exe.empty())
+                        if (auto img = CachedAppImage(exe, px)) rt_->CreateBitmapFromWicBitmap(img.Get(), nullptr, cached->bmp.Put());
+                }
                 cached->gen = t->iconGen;
             }
             float cx = (it.rc.left + it.rc.right) / 2;

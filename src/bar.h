@@ -23,6 +23,7 @@ public:
     // The lowest y the bar takes on its monitor when it doesn't auto-hide (0 when it does): windows go below it
     int ReservedBottom() const { return g_app.settings.barAutohide || IsRectEmpty(&home_) ? 0 : home_.bottom + MarginPx(); }
     HMONITOR Monitor() const { return mon_; }
+    std::wstring DebugLine() const;     // for the debug file
     bool Primary() const { return primary_; }
 
 private:
@@ -84,6 +85,11 @@ private:
     HWND trayDownHwnd_ = nullptr;     // the tray icon pressed (identity, not index)
     UINT trayDownUid_ = 0;
     bool fullscreenHidden_ = false;
+public:
+    void FlushPending();   // after a game: do what was put off (reposition, work area)
+private:
+    bool staleChecked_ = false;      // auto-hide: an old work-area reservation was looked for once
+    bool pendingRepos_ = false;   // Windows moved the app bars during a game: catch up afterwards
     // autohide + styles
     HWND trigger_ = nullptr;         // 2 px strip at the top edge that reveals the bar
     RECT home_{};                    // where the bar sits when shown (screen px)

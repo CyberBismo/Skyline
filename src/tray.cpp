@@ -5,6 +5,9 @@
 #include "bar.h"
 #include <cstddef>
 
+// One counter for every tray icon picture, so a generation number is never used twice
+UINT NextTrayGen() { static UINT s_gen = 0; return ++s_gen; }
+
 namespace {
 
 constexpr UINT kNIN_SELECT     = WM_USER + 0;
@@ -237,7 +240,7 @@ void CALLBACK TrayHost::MonitorTimer(HWND, UINT, UINT_PTR, DWORD) {
         if (!band || !IsWindow(band)) self->LinkTaskband();   // new Explorer, or its task band wasn't ready yet
     }
 
-    if (FindWindowW(L"Shell_TrayWnd", nullptr) != self->hwnd_) {
+    if (FindWindowW(L"Shell_TrayWnd", nullptr) != self->hwnd_ && !GameMode()) {   // (a game in fullscreen: later)
         // Explorer's tray got in front of ours: apps that registered icons just
         // now went there. Take the front spot back and ask them again.
         self->MakeTopmost();
@@ -316,9 +319,15 @@ LRESULT TrayHost::OnCopyData(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (n.uFlags & NIF_MESSAGE) t.callbackMsg = n.uCallbackMessage;
             if (n.uFlags & NIF_ICON) {
                 HICON src = Widen<HICON>(n.hIcon);
-                if (t.icon) DestroyIcon(t.icon);
-                t.icon = src ? CopyIcon(src) : nullptr;   // apps may destroy theirs right after
-                t.iconGen++;
+                HICON copy = src ? CopyIcon(src) : nullptr;   // apps may destroy theirs right after
+                if (!copy && src) copy = (HICON)CopyImage(src, IMAGE_ICON, 0, 0, 0);
+                // A copy that failed (or an app that sends "no icon" for a moment, seen with Steam) must not
+                // make the icon vanish: keep the one we have. Without any, the app's own exe icon is drawn.
+                if (copy || !t.icon) {
+                    if (t.icon) DestroyIcon(t.icon);
+                    t.icon = copy;
+                    t.iconGen = NextTrayGen();   // unique: a removed and re-added icon must never reuse an old picture
+                }
             }
             if (n.uFlags & NIF_TIP) t.tip = BoundedString(n.szTip, 128);
             if (n.uFlags & NIF_STATE) {
@@ -403,7 +412,7 @@ LRESULT TrayHost::OnCopyData(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 
 // ---------------------------------------------------------------------------
 bool TrayHost::Visible(const TrayIcon& t) const {
-    if (t.hidden || !t.icon) return false;
+    if (t.hidden || (!t.icon && t.exe.empty())) return false;   // no icon of its own: the bar draws the app's exe icon
     if (!t.callbackMsg && t.tip.empty()) return false;
     std::wstring tip = ToLower(t.tip);
     for (const auto& f : g_app.settings.hiddenTray) {

@@ -74,6 +74,8 @@ constexpr UINT WM_SKY_FOREGROUND   = WM_APP + 4;   // foreground window changed
 enum class Part { Bar, Dock, Start, Card, Media, Garden, Spotlight, Vibe, Flyout, Count };
 enum Material { MatAcrylic = 0, MatClear = 1, MatVibe = 2 };   // Vibe: acrylic + the colours of the hour (every part but VibeMenu itself)
 
+constexpr int kDockChosen = 10;          // Settings::dockMonitor: the screens the user picked
+
 struct Settings {
     int heightDip = 28;
     int material[(int)Part::Count] = {};   // MatAcrylic / MatClear (/ MatVibe) per part
@@ -97,7 +99,8 @@ struct Settings {
     bool hideTaskbar = true;
     bool smartHide = true;
     bool dockPreview = true;              // live window previews when hovering an icon
-    int dockMonitor = 0;                  // 0 main screen, 1 all screens, 2+k = screen k (left to right)
+    int dockMonitor = 0;                  // 0 main screen, 1 all screens, 2+k = screen k (left to right), kDockChosen = the screens below
+    std::vector<int> dockScreens;         // kDockChosen: these screens (0 = leftmost), [Dock] Screens=1,3 (counted from 1)
     int dockRevealWidth = 1;              // 0 under the dock, 1 a bit wider, 2 much wider, 3 whole bottom edge
     bool hotCorners = false;
     // plugins
@@ -114,6 +117,10 @@ struct Settings {
     int startMenu = 0;                    // 0 Windows' own, 1 SkyMenu, 2 SkyLauncher, 3 VibeMenu
     bool startWinKey = true;              // the Windows key opens ours
     bool menuFileSearch = true;           // SkyMenu: search shows files too
+    int menuSize = 1;                     // SkyMenu size: 0 small, 1 medium, 2 large, 3 extra large, 4 your own (dragged)
+    int menuScalePct = 100;               // the dragged size, in percent
+    bool menuResize = false;              // SkyMenu: drag its edges to resize
+    bool menuRecent = true;               // SkyMenu: "Recommended" – your latest files under the pinned apps
     bool launcherFileSearch = false;      // SkyLauncher: search shows files too (off: many don't want files there)
     // Spotlight (plugin): search apps, settings and files from a hotkey
     bool spotlightEnabled = false;
@@ -126,6 +133,7 @@ struct Settings {
     bool clockCalendar = false;
     // Look: themes, Liquid Glass and performance mode
     int lookTheme = 0;                    // 0 Standard, 1 Liquid Glass, 2 Vibe, 3 Frosted, 4 Matte, 5 Nordlys (what was last applied)
+    int glassTone = 0;                    // the colour of the glass: 0 Skyline's grey, 1 Midnight, 2 Ocean, 3 Sunset, 4 Forest, 5 Rosé
     bool aurora = false;                  // Nordlys: night-blue glass lit by the northern lights
     int auroraStrength = 60;              // how bright the lights are
     bool auroraFjord = true;              // in the daytime: "Fjord", icy blue, instead of the night colours
@@ -175,7 +183,9 @@ struct MenuGuard { MenuGuard() { ++g_menuDepth; } ~MenuGuard() { --g_menuDepth; 
 void ApplyGlassEffect(HWND h, Part part, bool cheap = false);   // cheap: plain blur while dragging
 int TintPercent(Part part);
 D2D1_COLOR_F GlassTint(Part part);            // colour to paint over the glass (alpha 0 = nothing to paint)
-D2D1_COLOR_F GlassColor(int percent);         // the tint colour itself
+D2D1_COLOR_F GlassColor(int percent);
+// The glass colour of the chosen tone (Settings::glassTone) for light or dark mode; false = Skyline's own grey
+bool ToneColor(bool dark, BYTE rgb[3]);         // the tint colour itself
 // "Vibe": the colours of the hour (VibeMenu's), mixed with the Windows accent
 void VibePalette(D2D1_COLOR_F out[3]);
 // Paints the Vibe colours over `area` when that part uses the Vibe material (does nothing otherwise).
@@ -191,7 +201,7 @@ void PaintStars(ID2D1RenderTarget* rt, D2D1_RECT_F area, float alpha);   // a st
 // Themes (look presets) and performance mode, in look.cpp
 namespace Look {
 const wchar_t* ThemeName(int i);
-constexpr int kThemes = 6;
+constexpr int kThemes = 11;
 void ApplyTheme(int theme);          // writes the look into skyline.ini (the previous look is kept for "Undo") and reloads
 bool CanUndo();
 void Undo();
@@ -240,6 +250,8 @@ extern Gfx g_gfx;
 // ---------------------------------------------------------------------------
 // Tray icon model
 // ---------------------------------------------------------------------------
+UINT NextTrayGen();   // tray.cpp: a fresh, never-reused number for a tray icon picture
+
 struct TrayIcon {
     HWND hwnd = nullptr;
     UINT uid = 0;
@@ -328,6 +340,9 @@ std::wstring FileDescriptionOf(const std::wstring& exePath);
 void SendHotkey(std::initializer_list<WORD> keys);
 bool AutostartEnabled();
 bool PrimaryFullscreen();
+// A game (or video) is fullscreen on any screen, or a game runs in exclusive fullscreen. While it is, Skyline keeps
+// completely still: no windows created or brought forward, no work-area changes, no tray announcements, no prompts.
+bool GameMode();
 // A Start menu is open (ours or Windows' own): the bar and the dock stay visible, even over a game.
 bool StartMenuOpen();
 void OurStartMenuShown(bool open);         // SkyMenu / SkyLauncher opened or closed

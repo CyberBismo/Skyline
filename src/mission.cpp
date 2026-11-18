@@ -7,6 +7,7 @@
 #include <cmath>
 #include <algorithm>
 #include <map>
+#include <memory>
 
 namespace {
 
@@ -199,14 +200,16 @@ void TakeForeground(HWND h) {
     }
 }
 
+void CloseAll(HWND chosen);          // all screens close together
+bool IsOverlayWindow(HWND h);
+std::vector<HWND> AllOverlayWindows();
+
 class Overlay {
 public:
     bool Visible() const { return hwnd_ && IsWindowVisible(hwnd_); }
 
-    void Show() {
-        POINT c;
-        GetCursorPos(&c);
-        mon_ = MonitorFromPoint(c, MONITOR_DEFAULTTOPRIMARY);
+    void Show(HMONITOR mon, bool focus) {
+        mon_ = mon;
         MONITORINFO mi{sizeof mi};
         GetMonitorInfoW(mon_, &mi);
         UINT dx = 96, dy = 96;
@@ -240,12 +243,18 @@ public:
         chosen_ = nullptr;
         hover_ = sel_ = -1;
         start_ = GetTickCount64();
-        ShowWindow(hwnd_, SW_SHOW);
-        TakeForeground(hwnd_);
-        // still refused (it happens from a hot corner): watch for clicks elsewhere ourselves
-        if (GetForegroundWindow() != hwnd_) SetTimer(hwnd_, T_OUTSIDE, 50, nullptr);
+        if (focus) {
+            ShowWindow(hwnd_, SW_SHOW);
+            TakeForeground(hwnd_);
+            // still refused (it happens from a hot corner): watch for clicks elsewhere ourselves
+            if (GetForegroundWindow() != hwnd_) SetTimer(hwnd_, T_OUTSIDE, 50, nullptr);
+        } else {
+            ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+        }
         SetTimer(hwnd_, T_FRAME, 10, nullptr);
     }
+
+    HWND Hwnd() const { return hwnd_; }
 
     void Close(HWND chosen = nullptr) {
         if (!hwnd_ || closing_) return;
@@ -393,7 +402,9 @@ private:
                     GetCursorPos(&c);
                     RECT r;
                     GetWindowRect(h, &r);
-                    if (!PtInRect(&r, c)) { KillTimer(h, T_OUTSIDE); self->Close(); }
+                    bool inAny = PtInRect(&r, c) != 0;
+                    for (HWND o : AllOverlayWindows()) { RECT ro; if (GetWindowRect(o, &ro) && PtInRect(&ro, c)) inAny = true; }
+                    if (!inAny) { KillTimer(h, T_OUTSIDE); CloseAll(nullptr); }
                 }
             }
             return 0;
@@ -405,23 +416,23 @@ private:
         case WM_LBUTTONUP: {
             if (self->closing_) return 0;
             int hv = self->thumbs_.HitTest(p);
-            self->Close(hv >= 0 ? self->thumbs_.Items()[hv].h : nullptr);
+            CloseAll(hv >= 0 ? self->thumbs_.Items()[hv].h : nullptr);
             return 0;
         }
-        case WM_RBUTTONUP: if (!self->closing_) self->Close(); return 0;
+        case WM_RBUTTONUP: if (!self->closing_) CloseAll(nullptr); return 0;
         case WM_KEYDOWN: {
             if (self->closing_) return 0;
             int n = (int)self->thumbs_.Items().size();
-            if (wp == VK_ESCAPE) self->Close();
-            else if (wp == VK_RETURN) self->Close(self->sel_ >= 0 && self->sel_ < n ? self->thumbs_.Items()[self->sel_].h : nullptr);
+            if (wp == VK_ESCAPE) CloseAll(nullptr);
+            else if (wp == VK_RETURN) CloseAll(self->sel_ >= 0 && self->sel_ < n ? self->thumbs_.Items()[self->sel_].h : nullptr);
             else if (n && (wp == VK_RIGHT || wp == VK_DOWN || wp == VK_TAB)) { self->sel_ = (self->sel_ + 1) % n; InvalidateRect(h, nullptr, FALSE); }
             else if (n && (wp == VK_LEFT || wp == VK_UP)) { self->sel_ = (self->sel_ + n - 1) % n; InvalidateRect(h, nullptr, FALSE); }
             return 0;
         }
         case WM_ACTIVATE:
-            if (LOWORD(wp) == WA_INACTIVE && !self->closing_) self->Close();
+            if (LOWORD(wp) == WA_INACTIVE && !self->closing_ && !IsOverlayWindow((HWND)lp)) CloseAll(nullptr);   // to another screen of ours: stay
             break;
-        case WM_CLOSE: self->Close(); return 0;
+        case WM_CLOSE: CloseAll(nullptr); return 0;
         }
         return DefWindowProcW(h, msg, wp, lp);
     }
@@ -441,15 +452,51 @@ private:
     std::map<std::wstring, ComPtr<ID2D1Bitmap>> bmps_;
 };
 
-Overlay g_overlay;
+std::map<HMONITOR, std::unique_ptr<Overlay>> g_overlays;   // one per screen
+
+std::vector<HWND> AllOverlayWindows() {
+    std::vector<HWND> v;
+    for (auto& [m, o] : g_overlays) if (o->Hwnd()) v.push_back(o->Hwnd());
+    return v;
+}
+bool IsOverlayWindow(HWND h) {
+    if (!h) return false;
+    for (auto& [m, o] : g_overlays) if (o->Hwnd() == h) return true;
+    return false;
+}
+void CloseAll(HWND chosen) {
+    for (auto& [m, o] : g_overlays) o->Close(chosen);
+}
+bool AnyVisible() {
+    for (auto& [m, o] : g_overlays) if (o->Visible()) return true;
+    return false;
+}
+BOOL CALLBACK EnumMon(HMONITOR m, HDC, LPRECT, LPARAM lp) {
+    reinterpret_cast<std::vector<HMONITOR>*>(lp)->push_back(m);
+    return TRUE;
+}
 
 } // namespace
 
 namespace MissionControl {
 bool Enabled() { return g_app.settings.missionEnabled; }
-bool Open() { return g_overlay.Visible(); }
+bool Open() { return AnyVisible(); }
 void Toggle() {
-    if (g_overlay.Visible()) g_overlay.Close();
-    else g_overlay.Show();
+    if (AnyVisible()) { CloseAll(nullptr); return; }
+    POINT c;
+    GetCursorPos(&c);
+    HMONITOR cur = MonitorFromPoint(c, MONITOR_DEFAULTTOPRIMARY);
+    std::vector<HMONITOR> mons;
+    EnumDisplayMonitors(nullptr, nullptr, EnumMon, (LPARAM)&mons);
+    // every screen at once (one less trip with the mouse); the one with the mouse is shown last and gets the keyboard
+    for (HMONITOR m : mons) {
+        if (m == cur) continue;
+        auto& o = g_overlays[m];
+        if (!o) o = std::make_unique<Overlay>();
+        o->Show(m, false);
+    }
+    auto& o = g_overlays[cur];
+    if (!o) o = std::make_unique<Overlay>();
+    o->Show(cur, true);
 }
 } // namespace MissionControl

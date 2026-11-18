@@ -11,7 +11,7 @@
 En native macOS-aktig **topplinje + dock** for Windows 11, laget av brukeren («Yen-Zen & Cyber») sammen med Claude.
 Ren C++20, Win32 + Direct2D/DirectWrite + DWM. Ingen webview, ingen .NET, ingen installasjon. Én exe på ca. 0,9 MB.
 Lisens: **GNU GPL-3.0 eller senere**. Credits i appen: «Made by Yen-Zen & Cyber and a whole bunch of Claude».
-Skal legges ut gratis på GitHub. **Siste versjon: 2.38** (9. okt 2026).
+Skal legges ut gratis på GitHub. **Siste versjon: 2.40.5** (16. nov 2026).
 
 > **Dette er prosjektet for Windows 11.** Skyline for Windows 10 er et **helt eget prosjekt** med egen kode, egen backup
 > (`Skyline-10-x.y-backup.zip`) og egen GitHub-pakke. Brukeren vil ha det slik for å holde det ryddig: ingen delt kode.
@@ -44,7 +44,7 @@ Skal legges ut gratis på GitHub. **Siste versjon: 2.38** (9. okt 2026).
 
 ## 3. Bygging
 
-Kryss-kompilering med **llvm-mingw** på Linux (Windows: `build.bat` med Visual Studio, eller CMake):
+Kryss-kompilering med **llvm-mingw** på Linux (Windows: `build.bat` med Visual Studio, eller CMake; `build.bat` spør om versjonsnummer og har valg 1 «Bygg vanlig» / 2 «Bygg setup» – setup bruker Inno Setup 6 og `tools/skyline.iss`, installerer per bruker uten admin):
 ```
 PATH=/tmp/llvm-mingw/bin:$PATH ./build.sh      # -> out/Skyline.exe
 ```
@@ -283,6 +283,56 @@ Alt nytt skal være lett: ingen kostnad før det brukes, hendelsesstyrt.
      (`kMsgDropFiles` = WM_APP+7); `DoDrop` flytter/kopierer med `IFileOperation` (angre, kollisjonsspørsmål) til skrivebordet,
      `LandedSink` gir de endelige navnene, og nøklene settes inn i bedet der brukeren slapp (fjernes fra andre bed først).
      Ble bedet bygget om i mellomtiden, tar catch-all-bedet dem.
+   **2.40.3:** **Fiks: tiling på skjerm som ligger over hovedskjermen (negativ topp, f.eks. y = -270) startet for langt nede med autoskjult topplinje.**
+     `Tiler::WorkArea` tok `max(skjermtopp, ReservedBottom())`, og `ReservedBottom()` er 0 når linja er autoskjult, så en negativ topp ble til 0.
+     Funnet via feilsøkingsfila (monitor 3: rcMonitor top -270, tilerArea top 0). Reservasjonen brukes nå bare når den er over 0.
+   **2.40.4:** **Fiks: autoskjult topplinje kom ikke fram med musa når et vindu var maksimert.**
+     `Bar::KeepOnTop` gikk ut tidlig når linja var skjult, så den tynne hover-stripa (`trigger_`) aldri ble løftet over det maksimerte vinduet.
+     Stripa løftes nå først (også når linja er skjult). Linja løftes også til øverst når den glir fram (kom før opp bak vinduene). Ikke testet på Windows.
+   **2.40.5:** **Mission Control åpner nå på alle skjermer samtidig** (før bare skjermen med musa).
+     `mission.cpp`: ett `Overlay` per skjerm (`g_overlays`); skjermen med musa får tastaturet. Klikk/Esc/høyreklikk lukker alle; å flytte fokus til en annen av våre skjermer lukker ikke. Ikke testet på Windows.
+   **2.40.2:** tiling husker størrelsene når et vindu minimeres og kommer tilbake (`Ratios::saved` per gruppe vinduer, `memIndex_` husker plassen i rekkefølgen).
+     Feilsøkingsfil: Ctrl+Alt+D eller knapp i Innstillinger > Tiling skriver `skyline-debug.txt` ved siden av skyline.ini (skjermer, arbeidsområde,
+     topplinje, vinduer). Autoskjult topplinje gir tilbake en gammel reservasjon øverst i Windows' arbeidsområde én gang (`Bar::EnsureWorkArea`).
+   **2.40.1:** tiling: toppen av arbeidsområdet tas fra skjermen, ikke fra Windows' arbeidsområde (`Tiler::WorkArea`). Med topplinja på autoskjuling lå
+     en gammel reservasjon igjen i Windows og vinduene startet langt nede (bare skjerm 1). Bare vår egen synlige linje reserverer plass.
+   **2.40.0:** **SkyMenu-størrelse.** Innstilling «SkyMenu: størrelse» (Liten 85 % / Middels 100 / Stor 120 / Ekstra stor 145 / Egendefinert), `[Start] MenuSize`
+     og `MenuScale` (%). Menyen tegnes i «designstørrelse» 640 x 660 dip og skaleres med `Menu::scale_` (transform i Paint, vindu, museposisjon,
+     ikonstørrelse); `FitScale` holder den på skjermen. Valgfri bryter «endre størrelse med musa» (`[Start] MenuResize`, av som standard): dra
+     venstre/høyre/øvre kant eller hjørne (6 dip), menyen vokser fra nedre midten, slipp lagrer «Egendefinert».
+   **2.39.2:** tiling står helt stille under spill (`GameMode()` i `Tiler::Retile`/`OnEvent`, tatt igjen etterpå via `FlushPending`): et tilet
+     spillvindu ble flyttet midt i skjermmodus-byttet og hoppet ut og inn av fullskjerm (CoD m.fl.).
+   **2.39.1 (16. nov 2026, tiling):**
+   - **Tiling: dra i kanten for å endre størrelse.** Ved slutt på dra (`EVENT_SYSTEM_MOVESIZEEND`) sammenlignes vinduets ramme med sluttet
+     det fikk (`targets_`). Endret størrelse -> `Tiler::ApplyResize` finner skillelinjen (`Split`) kanten satt på og flytter den
+     (`Ratios` per skjerm; nullstilles når oppsett eller antall vinduer endres); naboene flyter med. Flyttet hele vinduet -> bytter plass (`SwapAt`) som før.
+     Gjelder BSP, Master (master-bredde og stabel) og Kolonner. Bare ved slipp, ikke levende under draing.
+   - `Place`: en app som flytter seg selv (f.eks. ZenFiles gjenoppretter lagret plassering rett etter oppstart) får nye forsøk (`seen_`).
+   - Fullskjerm-sjekk: mens topplinje/dock er skjult for et fullskjermvindu sjekkes det på nytt hvert 2. sekund, så en tapt melding aldri
+     kan la dem bli borte til omstart. (Mistenkt årsak til «bugger på skjerm 1 etter ZenFiles»; ikke bekreftet.)
+   **2.39 (16. nov 2026, fra brukertilbakemeldinger; ikke testet på Windows, bare krysskompilert):**
+   - **Spillmodus:** under eksklusiv fullskjerm (`SHQueryUserNotificationState` = D3D_FULL_SCREEN, `GameMode()` i main.cpp) rører Skyline
+     ingenting: ingen ombygging av topplinje/dock ved skjermmodus-bytte (utsatt 250 ms-timer `kTimerDisplay`), ingen endring av
+     arbeidsområdet, ABN_POSCHANGED og tray-gjenkunngjøring utsettes, hot corners og oppdateringsvarsler venter. Tar igjen etterpå.
+   - **Steam-ikon i docken:** `Dock::LoadIcon` faller tilbake på exe-ikon og deretter vinduets ikon når Start-menyen ikke har oppføring.
+     Tray: robust ikon-kopi (`ImageFromIcon` via WIC + GDI-alfa), beholder gammelt ikon om nytt feiler.
+   - **Dock på flere skjermer:** `[Dock] Screens`, valg «valgte skjermer» (`kDockChosen`) med velger i Innstillinger.
+   - **SkyGarden mappe-bed:** et bed kan speile en mappe hvor som helst (`Bed::folder`, endringsvarsel per mappe, maks 600 elementer);
+     slipp inn i et mappe-bed flytter/kopierer filene inn i den mappen (`IFileOperation`, angre virker). Knapp «Nytt mappe-bed».
+   - **Fem temaer:** Midnatt (OLED-svart), Hav, Solnedgang, Skog, Rosé (`Look::kThemes = 11`, farget glass via `glassTone`).
+   - **SkyMenu:** bruker + strømmeny (dvale, bytt bruker), «Anbefalt» (nylige filer, bryter `[Start] MenuRecent`), mappesnarveier, A–Z-hopp.
+   - **Utseende:** dock: fin lyskant øverst og glorie bak aktiv prikk; runde hover-piller i topplinja; runde kort i Innstillinger.
+   - **build.bat:** spør etter versjonsnummer (skriver `src/version.h`) og tilbyr «Bygg vanlig» eller «Bygg setup».
+   **Neste (avtalt 16. nov 2026, tas en annen dag): «Enhanced Tiling» – en EGEN funksjon ved siden av vanlig tiling.**
+   Egen bryter, av som standard, egen kildefil (`enhancedtiling.cpp/.h`), og vanlig tiling (`tiling.cpp`) røres ikke, slik at den gamle kan brukes hvis noe feiler.
+   Innhold (brukeren sa «gjør alt»): layout-tre per skjerm (splitter og vinduer) med LEVENDE resizing; egne skillelinjer som kan gripes
+   (tynne gjennomsiktige vinduer i gapet, riktig musepeker, markeres ved hover); hurtigtaster for størrelse (f.eks. Ctrl+Alt+Win+piler) og «lik størrelse»;
+   hovedvindu-modus (promover til master); arbeidsområder per skjerm (4, bytt/send med Ctrl+Alt+1–4, skjules med SW_HIDE – må vises igjen i Stop());
+   regler per app (`[Tiling] Rules`: `exe=float`, `exe=monitor 2`, `exe=space 3`); dra-for-å-snappe med forhåndsvisning (midten = bytt, kant = del);
+   valgfri animasjon (~140 ms) og fokus-følger-musa (valgfri 120 ms-timer). Husk: ingenting kan testes her; brukeren tester mellom hver omgang.
+   Gjenbruk fra vanlig tiling: `Manageable`, `WorkArea` (toppen fra skjermen, rett håndtering av negativ topp), `Place`, `GameMode()`-stillstand,
+   husk størrelser/plass etter minimering (`Ratios::saved`, `memIndex_`). Feilsøking: Ctrl+Alt+D / knapp i Innstillinger skriver `skyline-debug.txt`
+   i installasjonsmappen (den installerte Skyline ligger i `%LocalAppData%\Programs\Skyline`, ikke i `out`).
    **Kjent, ikke gjort ennå (større ombygging):** Now Playing og SkyGarden poller (1–2 s) i stedet for hendelser; app-lista leses på
    UI-tråden etter at en meny lukkes; VibeMenu «Fortsett der du slapp» leser .lnk på UI-tråden; LL-tastaturkroken fjernes aldri;
    status-timer på 30 s; `Schtasks` venter på UI-tråden (maks 15 s); Wi-Fi WEP/OWE-profiler.

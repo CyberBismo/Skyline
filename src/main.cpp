@@ -28,7 +28,9 @@ Gfx g_gfx;
 
 namespace {
 
-constexpr UINT_PTR kTimerClock = 1, kTimerPurge = 2, kTimerNetwork = 3, kTimerDebounce = 4, kTimerFullscreen = 5, kTimerDeferred = 9;
+constexpr UINT_PTR kTimerClock = 1, kTimerPurge = 2, kTimerNetwork = 3, kTimerDebounce = 4, kTimerFullscreen = 5, kTimerDeferred = 9,
+                   kTimerDisplay = 10, kTimerGameWait = 11;
+bool g_displayPending = false;   // the screens changed during a game: rebuild once it is over
 static unsigned g_deferred = 0;   // bit per WM_SKY_STATUS code waiting for a menu to close
 HWINEVENTHOOK g_fsLocHook = nullptr;
 DWORD g_fsLocPid = 0;
@@ -299,7 +301,11 @@ Settings LoadSettings() {
     s.smartHide = GetPrivateProfileIntW(L"Dock", L"SmartHide", 1, p) != 0;
     s.dockRevealWidth = std::clamp((int)GetPrivateProfileIntW(L"Dock", L"RevealWidth", 1, p), 0, 3);
     s.dockPreview = GetPrivateProfileIntW(L"Dock", L"Preview", 1, p) != 0;
-    s.dockMonitor = std::clamp((int)GetPrivateProfileIntW(L"Dock", L"Monitor", 0, p), 0, 9);
+    s.dockMonitor = std::clamp((int)GetPrivateProfileIntW(L"Dock", L"Monitor", 0, p), 0, kDockChosen);
+    for (auto& n : SplitList(str(L"Dock", L"Screens", L""), L','))
+        if (int v = _wtoi(n.c_str()); v >= 1 && v <= 16 && std::find(s.dockScreens.begin(), s.dockScreens.end(), v - 1) == s.dockScreens.end())
+            s.dockScreens.push_back(v - 1);
+    if (s.dockMonitor == kDockChosen && s.dockScreens.empty()) s.dockMonitor = 0;
     s.npEnabled = GetPrivateProfileIntW(L"NowPlaying", L"Enabled", 0, p) != 0;
     s.npWhere = std::clamp((int)GetPrivateProfileIntW(L"NowPlaying", L"Where", 2, p), 0, 2);
     s.npBarPos = std::clamp((int)GetPrivateProfileIntW(L"NowPlaying", L"BarPosition", 0, p), 0, 3);
@@ -314,6 +320,10 @@ Settings LoadSettings() {
     if (s.startMenu < 0 || s.startMenu > 3) s.startMenu = 0;   // 5 was GnomeLauncher (removed in 2.22): back to Windows' own
     s.startWinKey = GetPrivateProfileIntW(L"Start", L"WinKey", 1, p) != 0;
     s.menuFileSearch = GetPrivateProfileIntW(L"Start", L"MenuFiles", 1, p) != 0;
+    s.menuRecent = GetPrivateProfileIntW(L"Start", L"MenuRecent", 1, p) != 0;
+    s.menuSize = std::clamp((int)GetPrivateProfileIntW(L"Start", L"MenuSize", 1, p), 0, 4);
+    s.menuScalePct = std::clamp((int)GetPrivateProfileIntW(L"Start", L"MenuScale", 100, p), 60, 200);
+    s.menuResize = GetPrivateProfileIntW(L"Start", L"MenuResize", 0, p) != 0;
     s.launcherFileSearch = GetPrivateProfileIntW(L"Start", L"LauncherFiles", 0, p) != 0;
     s.spotlightEnabled = GetPrivateProfileIntW(L"Spotlight", L"Enabled", 0, p) != 0;
     s.spotlightMods = GetPrivateProfileIntW(L"Spotlight", L"Modifiers", MOD_ALT, p) & (MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN);
@@ -325,6 +335,7 @@ Settings LoadSettings() {
     s.lookTheme = std::clamp((int)GetPrivateProfileIntW(L"Look", L"Theme", 0, p), 0, Look::kThemes - 1);
     s.liquidGlass = GetPrivateProfileIntW(L"Look", L"LiquidGlass", 0, p) != 0;
     s.aurora = GetPrivateProfileIntW(L"Look", L"Aurora", 0, p) != 0;
+    s.glassTone = std::clamp((int)GetPrivateProfileIntW(L"Look", L"Tone", 0, p), 0, 5);
     s.auroraStrength = std::clamp((int)GetPrivateProfileIntW(L"Look", L"AuroraStrength", 60, p), 0, 100);
     s.auroraFjord = GetPrivateProfileIntW(L"Look", L"AuroraFjord", 1, p) != 0;
     s.glassiness = std::clamp((int)GetPrivateProfileIntW(L"Look", L"Glassiness", 60, p), 0, 100);
@@ -412,8 +423,25 @@ int TintPercent(Part part) {
     }
 }
 
+bool ToneColor(bool dark, BYTE rgb[3]) {
+    // dark mode, light mode: deep and quiet colours, so text and icons stay easy to read
+    static const BYTE tones[6][2][3] = {
+        {{0, 0, 0}, {0, 0, 0}},
+        {{4, 4, 8}, {236, 236, 242}},        // Midnight: almost black (OLED)
+        {{6, 32, 58}, {216, 235, 248}},      // Ocean: deep blue
+        {{56, 18, 42}, {252, 228, 220}},     // Sunset: plum
+        {{12, 38, 26}, {220, 240, 226}},     // Forest: dark green
+        {{52, 22, 38}, {250, 226, 236}},     // Rosé: muted pink
+    };
+    int t = g_app.settings.glassTone;
+    if (t <= 0 || t > 5 || g_app.settings.performanceMode) return false;
+    for (int i = 0; i < 3; ++i) rgb[i] = tones[t][dark ? 0 : 1][i];
+    return true;
+}
+
 D2D1_COLOR_F GlassColor(int percent) {
     float a = std::clamp(percent, 0, 100) / 100.0f;
+    if (BYTE rgb[3]; !AuroraOn() && ToneColor(g_app.theme.dark, rgb)) return D2D1::ColorF(rgb[0] / 255.0f, rgb[1] / 255.0f, rgb[2] / 255.0f, a);
     if (AuroraOn()) return g_app.theme.dark ? D2D1::ColorF(0.04f, 0.08f, 0.17f, a) : D2D1::ColorF(0.87f, 0.93f, 0.98f, a);
     return g_app.theme.dark ? D2D1::ColorF(0.08f, 0.08f, 0.09f, a) : D2D1::ColorF(0.96f, 0.96f, 0.97f, a);
 }
@@ -697,6 +725,8 @@ void ApplyGlassEffect(HWND h, Part part, bool cheap) {
     DWORD col = (DWORD)a << 24 | c << 16 | c << 8 | c;
     if (AuroraOn())   // Nordlys: the glass itself is night blue (icy blue in light mode); colour is 0xAABBGGRR
         col = t.dark ? ((DWORD)a << 24 | 44u << 16 | 20u << 8 | 10u) : ((DWORD)a << 24 | 250u << 16 | 236u << 8 | 222u);
+    else if (BYTE rgb[3]; ToneColor(t.dark, rgb))   // a coloured theme: the glass takes its colour
+        col = (DWORD)a << 24 | (DWORD)rgb[2] << 16 | (DWORD)rgb[1] << 8 | rgb[0];
     AP p{state, 2, col, 0};
     WD d{19, &p, sizeof p};
     fn(h, &d);
@@ -745,7 +775,7 @@ void UnhideTray(const std::wstring& key) {
     // dropped or replaced its icon while it was hidden.
     if (g_app.tray) {
         g_app.tray->Reannounce();
-        for (auto& t : g_app.tray->Icons()) t.iconGen++;   // redraw bitmaps too
+        for (auto& t : g_app.tray->Icons()) t.iconGen = NextTrayGen();   // redraw bitmaps too
     }
     g_app.InvalidateAll();
     SetTimer(g_app.ctlWnd, 0x7111, 600, nullptr);   // and once more when the apps have answered
@@ -823,6 +853,19 @@ Theme LoadTheme() {
         t.solid = {0.953f, 0.953f, 0.953f, 1};
         t.green = {0.06f, 0.55f, 0.24f, 1};
         t.red = {0.77f, 0.17f, 0.11f, 1};
+    }
+    // The coloured themes bring their own accent (Midnight keeps Windows' own). LoadTheme runs after the settings.
+    static const float accents[6][2][3] = {
+        {{0, 0, 0}, {0, 0, 0}}, {{0, 0, 0}, {0, 0, 0}},
+        {{0.31f, 0.82f, 0.91f}, {0.02f, 0.47f, 0.62f}},   // Ocean: turquoise
+        {{1.00f, 0.62f, 0.42f}, {0.78f, 0.33f, 0.12f}},   // Sunset: warm orange
+        {{0.43f, 0.86f, 0.60f}, {0.10f, 0.50f, 0.27f}},   // Forest: green
+        {{1.00f, 0.56f, 0.72f}, {0.72f, 0.22f, 0.43f}},   // Rosé: pink
+    };
+    int tone = g_app.settings.glassTone;
+    if (tone >= 2 && tone <= 5 && !g_app.settings.performanceMode) {
+        const float* c = accents[tone][t.dark ? 0 : 1];
+        t.accent = {c[0], c[1], c[2], 1};
     }
     return t;
 }
@@ -986,8 +1029,19 @@ static bool CoversMonitor(HWND f, HMONITOR* monOut) {
     return false;
 }
 
-static bool g_primaryFullscreen = false;
+static bool g_primaryFullscreen = false, g_anyFullscreen = false;
 bool PrimaryFullscreen() { return g_primaryFullscreen; }
+
+static bool ExclusiveGame() {
+    QUERY_USER_NOTIFICATION_STATE q{};
+    return SUCCEEDED(SHQueryUserNotificationState(&q)) && q == QUNS_RUNNING_D3D_FULL_SCREEN;
+}
+
+bool GameMode() {
+    if (g_anyFullscreen || ExclusiveGame()) return true;
+    HMONITOR m = nullptr;
+    return !StartMenuOpen() && CoversMonitor(GetForegroundWindow(), &m);   // right now, before the next check has run
+}
 
 // Start menus: ours (SkyMenu/SkyLauncher) or Windows' own (Start, Search).
 static bool g_ourStart = false, g_winStart = false;
@@ -998,8 +1052,19 @@ static void CheckFullscreen() {
     // With a Start menu open you want the bar and the dock, even on top of a game.
     bool fs = !StartMenuOpen() && CoversMonitor(GetForegroundWindow(), &mon);
     g_primaryFullscreen = fs && mon == MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    g_anyFullscreen = fs;
+    // The screens changed while a game was up (it switched resolution): now that it's gone, catch up
+    if (!fs && g_displayPending && g_app.ctlWnd && !ExclusiveGame()) SetTimer(g_app.ctlWnd, kTimerDisplay, 300, nullptr);
     for (auto& b : g_app.bars) b->SetFullscreen(fs && b->Monitor() == mon);
     for (auto& d : g_app.docks) d->SetFullscreen(fs && mon == d->Monitor());
+    // While the bars are hidden for a fullscreen window, look again now and then: a missed event (a window that
+    // changed size without telling) must never leave the bar and dock hidden for good.
+    if (fs && g_app.ctlWnd) SetTimer(g_app.ctlWnd, kTimerFullscreen, 2000, nullptr);
+    if (!fs && !GameMode()) {   // nothing is covering the screens: do what was put off during a game
+        for (auto& b : g_app.bars) b->FlushPending();
+        for (auto& d : g_app.docks) d->FlushPending();
+        if (g_app.tiler) g_app.tiler->FlushPending();
+    }
 }
 
 void RecheckFullscreen() {
@@ -1099,6 +1164,13 @@ void App::RebuildDocks() {
     if (settings.dockMonitor == 1) {
         mons.push_back(primary);                       // primary first: it owns the taskbar hiding
         for (HMONITOR m : all) if (m != primary) mons.push_back(m);
+    } else if (settings.dockMonitor == kDockChosen) {
+        // the screens the user picked; the main screen first if it's one of them (that dock hides the taskbar)
+        for (int i : settings.dockScreens)
+            if (i >= 0 && i < (int)all.size() && all[i] == primary) mons.push_back(primary);
+        for (int i : settings.dockScreens)
+            if (i >= 0 && i < (int)all.size() && all[i] != primary && std::find(mons.begin(), mons.end(), all[i]) == mons.end()) mons.push_back(all[i]);
+        if (mons.empty()) mons.push_back(primary);   // none of them connected right now
     } else if (k >= 0 && k < (int)all.size()) {
         mons.push_back(all[k]);
     } else {
@@ -1213,6 +1285,25 @@ static LRESULT CALLBACK CtlProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             KillTimer(h, kTimerFullscreen);
             CheckFullscreen();
             break;
+        case kTimerDisplay:   // the screens changed (several windows say so at once: once is enough)
+            KillTimer(h, kTimerDisplay);
+            if (GameMode()) {
+                // A game in (exclusive) fullscreen switches resolution: creating, moving or showing windows now
+                // makes many games (Call of Duty and others) drop out of fullscreen, minimize or freeze. Wait.
+                g_displayPending = true;
+                SetTimer(h, kTimerGameWait, 2000, nullptr);
+                break;
+            }
+            g_displayPending = false;
+            KillTimer(h, kTimerGameWait);
+            g_app.RebuildBars(); g_app.RebuildDocks(); g_app.ApplyHotCorners();
+            CheckFullscreen();
+            SetTimer(h, kTimerFullscreen, 300, nullptr);
+            break;
+        case kTimerGameWait:   // only while a rebuild is waiting for a game to end
+            if (!g_displayPending) { KillTimer(h, kTimerGameWait); break; }
+            if (!GameMode()) { KillTimer(h, kTimerGameWait); SetTimer(h, kTimerDisplay, 10, nullptr); }
+            break;
         case kTimerDebounce:
             KillTimer(h, kTimerDebounce);
             g_app.status->RefreshVolume();
@@ -1239,6 +1330,7 @@ static LRESULT CALLBACK CtlProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case 1: g_app.status->RefreshAudioDevice(); g_app.InvalidateAll(); Flyouts::StatusChanged(); break;  // audio device
         case 2:                                                                     // reload settings
             g_app.settings = LoadSettings();
+            g_app.theme = LoadTheme();   // a theme may bring its own accent colour
             LoadMenuProfiles();
             if (g_app.fg.hwnd) { HWND f = g_app.fg.hwnd; g_app.fg.hwnd = nullptr; g_app.UpdateForeground(f); }
             g_app.RebuildBars();
@@ -1262,11 +1354,9 @@ static LRESULT CALLBACK CtlProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             Flyouts::ApplySettings();
             ArmClockTimer();
             break;
-        case 3:   // monitors changed (also when a game switches resolution): new bars must know about the game at once
-            g_app.RebuildBars(); g_app.RebuildDocks(); g_app.ApplyHotCorners();
-            CheckFullscreen();
-            SetTimer(h, kTimerFullscreen, 300, nullptr);
-            break;                                         // monitors changed
+        case 3:   // monitors changed (also when a game switches resolution): see kTimerDisplay
+            SetTimer(h, kTimerDisplay, 250, nullptr);
+            break;
         case 4: g_app.ReloadTheme(); break;                                         // light/dark
         case 5: SetTimer(h, kTimerFullscreen, 50, nullptr); break;                  // fullscreen hint
         case 10: case 11: case 12: case 13: HotCorners::Run((int)wp - 10); break;  // hot corner reached

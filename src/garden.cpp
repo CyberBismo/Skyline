@@ -27,10 +27,14 @@ const wchar_t* kRecycleBin = L"::{645FF040-5081-101B-9F08-00AA002F954E}";
 struct Item {
     std::wstring path, name;
     bool dir = false;
+    std::wstring owner;   // a folder bed's folder (lowercase) this item lives in; empty = a desktop item
     AppEntry entry;   // for the icon loader
 };
 std::map<std::wstring, Item> g_items;   // key: lowercase path
 HANDLE g_watch[2] = {nullptr, nullptr};
+std::map<std::wstring, HANDLE> g_folderWatch;   // folder beds: lowercase folder -> change notification
+std::vector<std::wstring> FolderBedFolders();    // the folders shown by folder beds (below the Bed class)
+constexpr size_t kFolderMax = 600;              // a huge folder (Downloads …) shows its first 600 items
 
 std::wstring KnownFolder(REFKNOWNFOLDERID id) {
     PWSTR p = nullptr;
@@ -76,6 +80,24 @@ void ScanDesktop() {
         } while (FindNextFileW(f, &fd));
         FindClose(f);
     }
+    // folder beds: the contents of their folder (not hidden or system files, like on the desktop)
+    for (const auto& folder : FolderBedFolders()) {
+        std::wstring lower = ToLower(folder);
+        WIN32_FIND_DATAW fd;
+        HANDLE f = FindFirstFileW((folder + L"\\*").c_str(), &fd);
+        if (f == INVALID_HANDLE_VALUE) continue;
+        size_t n = 0;
+        do {
+            if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+            if (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) continue;
+            std::wstring p = folder + L"\\" + fd.cFileName;
+            Item it = MakeItem(p, (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
+            it.owner = lower;
+            g_items.emplace(ToLower(p), std::move(it));   // (a desktop item keeps its place if a folder bed shows the desktop)
+            ++n;
+        } while (n < kFolderMax && FindNextFileW(f, &fd));
+        FindClose(f);
+    }
     Item bin;
     bin.path = kRecycleBin;
     bin.name = TR(L"Papirkurv", L"Recycle Bin");
@@ -98,6 +120,26 @@ void WatchDesktop() {
 
 void UnwatchDesktop() {
     for (auto& h : g_watch) if (h) { FindCloseChangeNotification(h); h = nullptr; }
+    for (auto& [f, h] : g_folderWatch) if (h) FindCloseChangeNotification(h);
+    g_folderWatch.clear();
+}
+
+// One change notification per folder a folder bed shows (opened and closed as beds come and go)
+void SyncFolderWatches() {
+    std::set<std::wstring> want;
+    for (const auto& f : FolderBedFolders()) want.insert(ToLower(f));
+    for (auto it = g_folderWatch.begin(); it != g_folderWatch.end();) {
+        if (want.count(it->first)) { ++it; continue; }
+        if (it->second) FindCloseChangeNotification(it->second);
+        it = g_folderWatch.erase(it);
+    }
+    for (const auto& f : FolderBedFolders()) {
+        std::wstring k = ToLower(f);
+        if (auto w = g_folderWatch.find(k); w != g_folderWatch.end() && w->second) continue;   // (a folder that was away is tried again)
+        g_folderWatch.erase(k);
+        HANDLE h = FindFirstChangeNotificationW(f.c_str(), FALSE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME);
+        g_folderWatch[k] = h == INVALID_HANDLE_VALUE ? nullptr : h;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +245,7 @@ public:
     RECT rc{};                 // screen pixels (expanded size)
     bool collapsed = false;
     bool catchAll = false;     // new desktop items land here
+    std::wstring folder;       // a folder bed: shows this folder (Documents …) instead of desktop items; drops go there
     std::vector<std::wstring> keys;
     HWND hwnd = nullptr;
 
@@ -406,7 +449,15 @@ private:
             rt_->FillRectangle(D2D1::RectF(0, 0, sz.width, kTitle), brush_.Get());
         }
         brush_->SetColor(th.fg);
-        if (fTitle_) rt_->DrawTextW(name.c_str(), (UINT32)name.size(), fTitle_.Get(), D2D1::RectF(14, 0, sz.width - 30, kTitle), brush_.Get(),
+        float titleX = 14;
+        if (!folder.empty() && fGlyph_) {   // a folder bed: a little folder before the name
+            wchar_t g = 0xE8B7;
+            brush_->SetColor(th.accent);
+            rt_->DrawTextW(&g, 1, fGlyph_.Get(), D2D1::RectF(10, 0, 30, kTitle), brush_.Get());
+            brush_->SetColor(th.fg);
+            titleX = 32;
+        }
+        if (fTitle_) rt_->DrawTextW(name.c_str(), (UINT32)name.size(), fTitle_.Get(), D2D1::RectF(titleX, 0, sz.width - 30, kTitle), brush_.Get(),
                                     D2D1_DRAW_TEXT_OPTIONS_CLIP);
         wchar_t chev = collapsed ? 0xE70D : 0xE70E;
         brush_->SetColor(titleHover_ ? th.fg : th.fgDim);
@@ -1008,9 +1059,11 @@ private:
     // moved on the same drive, copied from another drive, Ctrl copies, Shift moves, Alt makes a shortcut.
     // Windows does the moving itself: its usual "file already exists" question, progress and Ctrl+Z all work.
     void DoDrop(const PendingDrop& j) {
-        std::wstring desk = KnownFolder(FOLDERID_Desktop), pub = KnownFolder(FOLDERID_PublicDesktop);
+        // a folder bed: into its folder; any other bed: onto the desktop
+        std::wstring desk = folder.empty() ? KnownFolder(FOLDERID_Desktop) : folder;
+        std::wstring pub = folder.empty() ? KnownFolder(FOLDERID_PublicDesktop) : std::wstring();
         if (desk.empty()) return;
-        auto onDesktop = [&](const std::wstring& f) {
+        auto onDesktop = [&](const std::wstring& f) {   // already where this bed shows files
             std::wstring dir = ToLower(f.substr(0, f.find_last_of(L"\\")));
             return dir == ToLower(desk) || (!pub.empty() && dir == ToLower(pub));
         };
@@ -1057,6 +1110,17 @@ private:
         g_drag = Drag();
         if (d.keys.empty()) d.keys.push_back(d.key);
         auto dragged = [&](const std::wstring& k) { return std::find(d.keys.begin(), d.keys.end(), k) != d.keys.end(); };
+        if (d.target && d.from && ToLower(d.target->folder) != ToLower(d.from->folder)) {
+            // into (or out of) a folder bed: the files really move to where that bed shows things
+            std::vector<std::wstring> files;
+            for (const auto& k : d.keys) {
+                auto it = g_items.find(k);
+                if (it != g_items.end() && it->second.path.compare(0, 2, L"::") != 0) files.push_back(it->second.path);
+            }
+            for (auto& b : g_beds) { b->selected_.clear(); b->Invalidate(); }
+            if (!files.empty()) d.target->QueueDrop(std::move(files), DROPEFFECT_MOVE, d.index);
+            return;
+        }
         if (d.target && d.from) {
             // index counts visible items; the items land before the first one there that isn't moving
             auto vis = d.target->Visible();
@@ -1097,6 +1161,64 @@ private:
     std::vector<PendingDrop> pending_;
 
 };
+
+std::vector<std::wstring> FolderBedFolders() {
+    std::vector<std::wstring> out;
+    for (auto& b : g_beds)
+        if (!b->folder.empty() && std::none_of(out.begin(), out.end(), [&](auto& f) { return ToLower(f) == ToLower(b->folder); }))
+            out.push_back(b->folder);
+    return out;
+}
+
+// The folder's own name, as Explorer shows it ("Dokumenter", "Nedlastinger" …)
+std::wstring FolderTitle(const std::wstring& path) {
+    ComPtr<IShellItem> it;
+    if (SUCCEEDED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(it.Put())))) {
+        PWSTR n = nullptr;
+        if (SUCCEEDED(it->GetDisplayName(SIGDN_NORMALDISPLAY, &n)) && n) { std::wstring s = n; CoTaskMemFree(n); return s; }
+    }
+    return FileNameOf(path);
+}
+
+// Windows' own "choose a folder" dialog. Not the desktop itself (that's what the other beds show).
+std::wstring PickFolder(HWND owner, const std::wstring& start) {
+    ComPtr<IFileOpenDialog> dlg;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(dlg.Put())))) return {};
+    DWORD opt = 0;
+    dlg->GetOptions(&opt);
+    dlg->SetOptions(opt | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+    dlg->SetTitle(TR(L"Velg mappen bedet skal vise", L"Choose the folder the bed shows"));
+    std::wstring first = start.empty() ? KnownFolder(FOLDERID_Documents) : start;
+    ComPtr<IShellItem> at;
+    if (!first.empty() && SUCCEEDED(SHCreateItemFromParsingName(first.c_str(), nullptr, IID_PPV_ARGS(at.Put())))) dlg->SetFolder(at.Get());
+    ++g_modal;
+    HRESULT hr = dlg->Show(owner);
+    --g_modal;
+    if (FAILED(hr)) return {};
+    ComPtr<IShellItem> res;
+    if (FAILED(dlg->GetResult(res.Put()))) return {};
+    PWSTR p = nullptr;
+    std::wstring out;
+    if (SUCCEEDED(res->GetDisplayName(SIGDN_FILESYSPATH, &p)) && p) { out = p; CoTaskMemFree(p); }
+    while (out.size() > 3 && out.back() == L'\\') out.pop_back();
+    if (out.empty()) return {};
+    if (out.size() <= 3) {   // "D:\": a whole drive; the paths would not match later
+        MessageBoxW(owner, TR(L"Velg en mappe på stasjonen, ikke selve stasjonen.", L"Choose a folder on the drive, not the drive itself."), L"SkyGarden", MB_ICONINFORMATION);
+        return {};
+    }
+    for (const auto& f : FolderBedFolders())
+        if (ToLower(f) == ToLower(out)) {
+            MessageBoxW(owner, TR(L"Den mappen vises allerede i et bed.", L"That folder is already shown in a bed."), L"SkyGarden", MB_ICONINFORMATION);
+            return {};
+        }
+    std::wstring l = ToLower(out);
+    if (l == ToLower(KnownFolder(FOLDERID_Desktop)) || l == ToLower(KnownFolder(FOLDERID_PublicDesktop))) {
+        MessageBoxW(owner, TR(L"Skrivebordet vises allerede i de vanlige bedene. Velg en annen mappe.",
+                              L"The desktop is already shown in the regular beds. Choose another folder."), L"SkyGarden", MB_ICONINFORMATION);
+        return {};
+    }
+    return out;
+}
 
 std::set<HWND> BedWindows() {
     std::set<HWND> s;
@@ -1227,7 +1349,8 @@ public:
     HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* d, DWORD keys, POINTL pt, DWORD* eff) override {
         files_ = Files(d);
         allDesk_ = !files_.empty();
-        std::wstring desk = ToLower(KnownFolder(FOLDERID_Desktop)), pub = ToLower(KnownFolder(FOLDERID_PublicDesktop));
+        std::wstring desk = ToLower(bed_->folder.empty() ? KnownFolder(FOLDERID_Desktop) : bed_->folder);
+        std::wstring pub = bed_->folder.empty() ? ToLower(KnownFolder(FOLDERID_PublicDesktop)) : std::wstring();
         for (const auto& f : files_) {
             std::wstring dir = ToLower(f.substr(0, f.find_last_of(L"\\")));
             if (dir != desk && (pub.empty() || dir != pub)) { allDesk_ = false; break; }
@@ -1402,9 +1525,16 @@ void Bed::Rename() {
 }
 
 void Bed::BedMenu(POINT screen) {
-    enum { CNew = 1, CRename, CSort, CCollapse, CDelete, CSettings };
+    enum { CNew = 1, CRename, CSort, CCollapse, CDelete, CSettings, CNewFolder, COpenFolder, CChangeFolder };
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, CNew, TR(L"Nytt bed", L"New bed"));
+    AppendMenuW(m, MF_STRING, CNewFolder, TR(L"Nytt mappe-bed …", L"New folder bed …"));
+    if (!folder.empty()) {
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(m, MF_STRING, COpenFolder, TR(L"Åpne mappen", L"Open the folder"));
+        AppendMenuW(m, MF_STRING, CChangeFolder, TR(L"Vis en annen mappe …", L"Show another folder …"));
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    }
     AppendMenuW(m, MF_STRING, CRename, TR(L"Gi nytt navn …", L"Rename …"));
     AppendMenuW(m, MF_STRING, CSort, TR(L"Sorter etter navn", L"Sort by name"));
     AppendMenuW(m, MF_STRING, CCollapse, collapsed ? TR(L"Rull ned", L"Roll down") : TR(L"Rull opp", L"Roll up"));
@@ -1426,6 +1556,21 @@ void Bed::BedMenu(POINT screen) {
     DestroyMenu(m);
     switch (cmd) {
     case CNew: Garden::NewBed(); break;
+    case CNewFolder: { POINT c; GetCursorPos(&c); Garden::NewFolderBedAt(c); break; }
+    case COpenFolder: ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL); break;
+    case CChangeFolder: {
+        std::wstring f = PickFolder(hwnd, folder);
+        if (f.empty()) break;
+        folder = f;
+        name = FolderTitle(f);
+        keys.clear();
+        SyncFolderWatches();
+        ScanDesktop();
+        Distribute();
+        Invalidate();
+        ScheduleSave();
+        break;
+    }
     case CRename: Rename(); break;
     case CSort:
         std::sort(keys.begin(), keys.end(), [](const std::wstring& a, const std::wstring& b) {
@@ -1466,6 +1611,7 @@ void Save() {
         w(L"H", std::to_wstring(b.rc.bottom - b.rc.top));
         w(L"Collapsed", b.collapsed ? L"1" : L"0");
         w(L"CatchAll", b.catchAll ? L"1" : L"0");
+        w(L"Folder", b.folder);
         w(L"Items", JoinList(b.keys, L"|"));
     }
     WritePrivateProfileStringW(nullptr, nullptr, nullptr, ini.c_str());   // flush
@@ -1482,16 +1628,33 @@ void ScheduleSave() {
 void Distribute() {
     std::set<std::wstring> placed;
     for (auto& b : g_beds) {
+        std::wstring mine = ToLower(b->folder);
+        bool folderThere = mine.empty() || GetFileAttributesW(b->folder.c_str()) != INVALID_FILE_ATTRIBUTES;
         std::vector<std::wstring> keep;
-        for (auto& k : b->keys) if (!placed.count(k)) { keep.push_back(k); placed.insert(k); }
-        b->keys = keep;   // items that are gone stay listed (they may come back, e.g. a drive), but aren't drawn
+        for (auto& k : b->keys) {
+            if (placed.count(k)) continue;
+            auto it = g_items.find(k);
+            if (it != g_items.end() && it->second.owner != mine) continue;   // belongs to another kind of bed
+            // a folder bed forgets files that left its folder (unless the folder itself is away, e.g. a USB stick)
+            if (it == g_items.end() && !mine.empty() && folderThere) continue;
+            keep.push_back(k);
+            placed.insert(k);
+        }
+        b->keys = keep;   // desktop items that are gone stay listed (they may come back, e.g. a drive), but aren't drawn
+    }
+    // new files in a folder bed's folder: at the end of that bed
+    for (auto& b : g_beds) {
+        if (b->folder.empty()) continue;
+        std::wstring mine = ToLower(b->folder);
+        for (auto& [k, it] : g_items)
+            if (it.owner == mine && !placed.count(k)) { b->keys.push_back(k); placed.insert(k); }
     }
     Bed* catchAll = nullptr;
-    for (auto& b : g_beds) if (b->catchAll) catchAll = b.get();
-    if (!catchAll && !g_beds.empty()) { catchAll = g_beds.front().get(); catchAll->catchAll = true; }
+    for (auto& b : g_beds) if (b->catchAll && b->folder.empty()) catchAll = b.get();
+    if (!catchAll) for (auto& b : g_beds) if (b->folder.empty()) { catchAll = b.get(); catchAll->catchAll = true; break; }
     if (!catchAll) return;
     for (auto& [k, it] : g_items)
-        if (!placed.count(k)) { catchAll->keys.push_back(k); placed.insert(k); }
+        if (it.owner.empty() && !placed.count(k)) { catchAll->keys.push_back(k); placed.insert(k); }
 }
 
 void DefaultLayout() {
@@ -1535,6 +1698,8 @@ void Load() {
         b->rc = {x, y, x + std::max(120, w), y + std::max(80, h)};
         b->collapsed = GetPrivateProfileIntW(sec.c_str(), L"Collapsed", 0, ini.c_str()) != 0;
         b->catchAll = GetPrivateProfileIntW(sec.c_str(), L"CatchAll", 0, ini.c_str()) != 0;
+        b->folder = IniStr(ini, sec.c_str(), L"Folder");
+        if (!b->folder.empty()) b->catchAll = false;   // a folder bed never takes desktop items
         b->keys = SplitList(IniStr(ini, sec.c_str(), L"Items"), L'|');
         // off-screen after a monitor change? bring it back
         RECT vs{GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN), 0, 0};
@@ -1552,7 +1717,7 @@ void DeleteBed(Bed* b) {
     if (!b || b->catchAll) return;
     Bed* catchAll = nullptr;
     for (auto& x : g_beds) if (x->catchAll) catchAll = x.get();
-    if (catchAll) for (auto& k : b->keys) catchAll->keys.push_back(k);
+    if (catchAll && b->folder.empty()) for (auto& k : b->keys) catchAll->keys.push_back(k);   // a folder bed's files just stop showing
     auto it = std::find_if(g_beds.begin(), g_beds.end(), [&](auto& p) { return p.get() == b; });
     if (it != g_beds.end()) {
         // destroyed a moment later: we're inside this bed's own window procedure
@@ -1562,6 +1727,7 @@ void DeleteBed(Bed* b) {
         Bury(doomed);
     }
     if (catchAll) catchAll->Invalidate();
+    SyncFolderWatches();   // a folder bed that went: stop watching its folder
     ScheduleSave();
 }
 
@@ -1569,6 +1735,8 @@ void CALLBACK Tick(HWND, UINT, UINT_PTR, DWORD) {
     if (!g_running) return;
     bool changed = false;
     for (auto& h : g_watch)
+        if (h && WaitForSingleObject(h, 0) == WAIT_OBJECT_0) { FindNextChangeNotification(h); changed = true; }
+    for (auto& [f, h] : g_folderWatch)
         if (h && WaitForSingleObject(h, 0) == WAIT_OBJECT_0) { FindNextChangeNotification(h); changed = true; }
     if (changed) {
         ScanDesktop();
@@ -1675,10 +1843,12 @@ void ApplySettings() {
         g_running = true;
         ScanDesktop();
         Load();
+        ScanDesktop();   // again, now that the folder beds are known
         Distribute();
         for (auto& b : g_beds) b->Create();
         ShowDesktopIcons(false);
         WatchDesktop();
+        SyncFolderWatches();
         g_timer = SetTimer(nullptr, 0, 1500, Tick);
     } else if (!on && g_running) {
         Shutdown();
@@ -1686,6 +1856,7 @@ void ApplySettings() {
         // Re-applying the glass blinks the beds; only do it when their look changed.
         static std::wstring last;
         std::wstring key = std::to_wstring(g_app.settings.material[(int)Part::Garden]) + L"," + std::to_wstring(g_app.settings.gardenTintPercent) +
+                           L"," + std::to_wstring(g_app.settings.glassTone) +
                            L"," + std::to_wstring((int)g_app.theme.dark);
         if (key != last) { last = key; ThemeChanged(); }
         else for (auto& b : g_beds) b->Invalidate();
@@ -1737,6 +1908,31 @@ void NewBedAt(POINT c) {
     ScheduleSave();
 }
 
+void NewFolderBedAt(POINT c) {
+    if (!g_running) return;
+    std::wstring folder = PickFolder(nullptr, L"");
+    if (folder.empty()) return;
+    HMONITOR mon = MonitorFromPoint(c, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO mi{sizeof mi};
+    GetMonitorInfoW(mon, &mi);
+    UINT dx = 96, dy = 96;
+    GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dx, &dy);
+    int w = MulDiv(340, dx, 96), h = MulDiv(260, dx, 96);
+    int x = std::clamp((int)c.x - w / 2, (int)mi.rcWork.left + 8, std::max((int)mi.rcWork.left + 8, (int)mi.rcWork.right - w - 8));
+    int y = std::clamp((int)c.y - MulDiv(15, dx, 96), (int)mi.rcWork.top + 8, std::max((int)mi.rcWork.top + 8, (int)mi.rcWork.bottom - h - 8));
+    auto b = std::make_unique<Bed>();
+    b->name = FolderTitle(folder);
+    b->folder = folder;
+    b->rc = {x, y, x + w, y + h};
+    Bed* raw = b.get();
+    g_beds.push_back(std::move(b));
+    SyncFolderWatches();
+    ScanDesktop();
+    Distribute();
+    raw->Create();
+    ScheduleSave();
+}
+
 void ResetLayout() {
     std::wstring ini = ExeDir() + L"\\garden.ini";
     DeleteFileW(ini.c_str());
@@ -1746,6 +1942,8 @@ void ResetLayout() {
     Bury(g_beds);
     ScanDesktop();
     Load();
+    SyncFolderWatches();
+    ScanDesktop();
     Distribute();
     for (auto& b : g_beds) b->Create();
 }
@@ -1774,6 +1972,7 @@ void DesktopMenu(POINT pt) {
     if (!owner) return;
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, 1, TR(L"Nytt bed her", L"New bed here"));
+    AppendMenuW(m, MF_STRING, 2, TR(L"Nytt mappe-bed her …", L"New folder bed here …"));
     // Windows' own desktop menu (New, Display settings, Personalize …) below ours
     ComPtr<IShellFolder> desk;
     ComPtr<IContextMenu> cm;
@@ -1797,6 +1996,8 @@ void DesktopMenu(POINT pt) {
     g_deskCm3.Reset();
     if (cmd == 1) {
         NewBedAt(pt);
+    } else if (cmd == 2) {
+        NewFolderBedAt(pt);
     } else if (cmd >= 100 && cm) {
         CMINVOKECOMMANDINFOEX ici{sizeof ici};
         ici.fMask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE;
