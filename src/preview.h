@@ -24,6 +24,8 @@ private:
         D2D1_RECT_F slot{};     // whole cell (DIPs)
         D2D1_RECT_F thumb{};    // thumbnail area (DIPs)
         HTHUMBNAIL th = nullptr;
+        ComPtr<IWICBitmapSource> snap;    // hidden window (Enhanced Tiling workspace): its last picture
+        ComPtr<ID2D1Bitmap> snapBmp;
         bool iconic = false;
     };
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);

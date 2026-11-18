@@ -3,6 +3,7 @@
 #include "mission.h"
 #include "app.h"
 #include "icons.h"
+#include "enhancedtiling.h"
 #include <shellscalingapi.h>
 #include <cmath>
 #include <algorithm>
@@ -183,6 +184,10 @@ namespace {
 
 constexpr UINT_PTR T_FRAME = 1, T_OUTSIDE = 2;
 
+// A workspace picked in the strip: the switch happens when Mission Control has closed (see Finish).
+HMONITOR g_pendMon = nullptr;
+int g_pendSpace = 0;
+
 // Windows only lets the app that got the last input take the foreground: a harmless empty mouse input
 // makes that us; if that's still refused, borrow the foreground thread's input state for a moment.
 void TakeForeground(HWND h) {
@@ -233,8 +238,13 @@ public:
         DwmSetWindowAttribute(hwnd_, DWMWA_EXCLUDED_FROM_PEEK, &exclude, sizeof exclude);
         ApplyGlassEffect(hwnd_, Part::Start);
         thumbs_.Collect(mon_, hwnd_);
-        // the grid: leave room for the top bar and the dock
+        // Enhanced Tiling: a strip with the four workspaces along the top
+        spaces_.clear();
+        snapBmps_.clear();
+        cardHover_ = -1;
         int top = MulDiv(g_app.settings.heightDip + 34, dpi_, 96), bottom = MulDiv(96, dpi_, 96), side = MulDiv(40, dpi_, 96);
+        if (EnhancedSpacesAvailable()) spaces_ = EnhancedSpacesInfo(mon_, &waSz_);
+        if (!spaces_.empty()) { LayoutCards(); top = stripBottom_; }
         RECT area{side, top, (r.right - r.left) - side, (r.bottom - r.top) - bottom};
         thumbs_.Layout(area, dpi_ / 96.0f);
         thumbs_.Step(0);
@@ -256,6 +266,29 @@ public:
 
     HWND Hwnd() const { return hwnd_; }
 
+    HMONITOR Mon() const { return mon_; }
+
+    // The workspace cards in a row, then a "+" to add one more. Height stays the same however many there are.
+    void LayoutCards() {
+        RECT cr;
+        GetClientRect(hwnd_, &cr);
+        float k = dpi_ / 96.0f, W = (float)(cr.right - cr.left), side = 40 * k, gap = 14 * k, plusW = 52 * k;
+        int n = (int)spaces_.size();
+        float ratio = (float)std::max<LONG>(1, waSz_.cx) / (float)std::max<LONG>(1, waSz_.cy);
+        // height is fixed by the four-card layout
+        float cw4 = std::min(210.0f * k, (W - 2 * side - plusW - 4 * gap) / 4.0f);
+        float bodyH = std::min((cw4 - 16 * k) / ratio, 130.0f * k);
+        cardH_ = bodyH + 32 * k;
+        float cw = std::min(cw4 + 0.0f, (W - 2 * side - plusW - n * gap) / std::max(1, n));
+        cw = std::max(cw, 46 * k);
+        float total = n * cw + n * gap + plusW, x0 = (W - total) / 2, y0 = (float)MulDiv(g_app.settings.heightDip + 14, dpi_, 96);
+        cards_.assign(n, {});
+        for (int i = 0; i < n; ++i) cards_[i] = D2D1::RectF(x0 + i * (cw + gap), y0, x0 + i * (cw + gap) + cw, y0 + cardH_);
+        float px = x0 + n * (cw + gap);
+        plusRc_ = D2D1::RectF(px, y0, px + plusW, y0 + cardH_);
+        stripBottom_ = (int)(y0 + cardH_ + 18 * k);
+        canRemove_ = n > 2 && EnhancedCanRemoveSpace();
+    }
     void Close(HWND chosen = nullptr) {
         if (!hwnd_ || closing_) return;
         closing_ = true;
@@ -289,11 +322,17 @@ private:
         ShowWindow(h, SW_HIDE);
         hwnd_ = nullptr;
         bmps_.clear();
+        snapBmps_.clear();
         font_.Reset();   // the next screen may have another scale
         rt_.Reset();
         brush_.Reset();
         SetWindowLongPtrW(h, GWLP_USERDATA, 0);
         DestroyWindow(h);
+        if (g_pendSpace > 0 && g_pendMon == mon_) {   // a workspace was picked: go there now that everything is closed
+            int n = g_pendSpace;
+            g_pendSpace = 0;
+            EnhancedSwitchSpace(mon_, n);
+        }
     }
 
     bool Resources() {
@@ -331,6 +370,110 @@ private:
         return b.Get();
     }
 
+    // The workspace strip: four little screens with the windows in them (their last picture), the current one framed.
+    void PaintSpaces(float k) {
+        const Theme& th = g_app.theme;
+        float fade = std::clamp(anim_ * 1.4f, 0.0f, 1.0f);
+        for (int i = 0; i < (int)spaces_.size() && i < (int)cards_.size(); ++i) {
+            const auto& sp = spaces_[i];
+            const D2D1_RECT_F& c = cards_[i];
+            brush_->SetColor(D2D1::ColorF(1, 1, 1, (i == cardHover_ ? 0.20f : 0.11f) * fade));
+            rt_->FillRoundedRectangle(D2D1::RoundedRect(c, 12 * k, 12 * k), brush_.Get());
+            if (sp.current) {
+                brush_->SetColor(D2D1::ColorF(th.accent.r, th.accent.g, th.accent.b, fade));
+                rt_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.left + k, c.top + k, c.right - k, c.bottom - k), 12 * k, 12 * k), brush_.Get(), 2.5f * k);
+            }
+            std::wstring label = std::to_wstring(sp.n) + L"   " + (sp.wins.empty() ? std::wstring(TR(L"tom", L"empty"))
+                                 : std::to_wstring(sp.wins.size()) + L" " + (sp.wins.size() == 1 ? TR(L"vindu", L"window") : TR(L"vinduer", L"windows")));
+            brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.9f * fade));
+            rt_->DrawTextW(label.c_str(), (UINT32)label.size(), font_.Get(), D2D1::RectF(c.left, c.top + 3 * k, c.right, c.top + 26 * k), brush_.Get());
+            D2D1_RECT_F body = D2D1::RectF(c.left + 8 * k, c.top + 28 * k, c.right - 8 * k, c.bottom - 8 * k);
+            {   // keep the screen's proportions, centred in what is left of the card
+                float bw0 = body.right - body.left, bh0 = body.bottom - body.top, want = bw0 * (float)waSz_.cy / (float)std::max<LONG>(1, waSz_.cx);
+                if (want < bh0) { float m = (bh0 - want) / 2; body.top += m; body.bottom -= m; }
+            }
+            brush_->SetColor(D2D1::ColorF(0, 0, 0, 0.38f * fade));
+            rt_->FillRoundedRectangle(D2D1::RoundedRect(body, 5 * k, 5 * k), brush_.Get());
+            float bw = body.right - body.left, bh = body.bottom - body.top;
+            for (const auto& w : sp.wins) {
+                D2D1_RECT_F r = D2D1::RectF(body.left + w.l * bw, body.top + w.t * bh, body.left + w.r * bw, body.top + w.b * bh);
+                ID2D1Bitmap* bmp = nullptr;
+                auto it = snapBmps_.find(w.h);
+                if (it == snapBmps_.end()) {
+                    ComPtr<ID2D1Bitmap> b;
+                    if (auto src = EnhancedSnapshot(w.h)) rt_->CreateBitmapFromWicBitmap(src.Get(), nullptr, b.Put());
+                    it = snapBmps_.emplace(w.h, b).first;
+                }
+                bmp = it->second.Get();
+                if (bmp) rt_->DrawBitmap(bmp, r, fade, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                else {
+                    brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.16f * fade));
+                    rt_->FillRectangle(r, brush_.Get());
+                }
+                brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.35f * fade));
+                rt_->DrawRectangle(r, brush_.Get(), 1.0f);
+            }
+        }
+        if (canRemove_ && !cards_.empty()) {   // "x" on the last card
+            D2D1_RECT_F xr = XRect();
+            float cxp = (xr.left + xr.right) / 2, cyp = (xr.top + xr.bottom) / 2, arm = 3.5f * k;
+            brush_->SetColor(D2D1::ColorF(1, 1, 1, (xHover_ ? 0.30f : 0.14f) * fade));
+            rt_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cxp, cyp), 9 * k, 9 * k), brush_.Get());
+            brush_->SetColor(D2D1::ColorF(1, 1, 1, (xHover_ ? 1.0f : 0.75f) * fade));
+            rt_->DrawLine(D2D1::Point2F(cxp - arm, cyp - arm), D2D1::Point2F(cxp + arm, cyp + arm), brush_.Get(), 1.6f * k, nullptr);
+            rt_->DrawLine(D2D1::Point2F(cxp - arm, cyp + arm), D2D1::Point2F(cxp + arm, cyp - arm), brush_.Get(), 1.6f * k, nullptr);
+        }
+        if (spaces_.size() < 8) {   // the "+" card
+            float cxp = (plusRc_.left + plusRc_.right) / 2, cyp = (plusRc_.top + plusRc_.bottom) / 2, arm = 9 * k;
+            brush_->SetColor(D2D1::ColorF(1, 1, 1, (plusHover_ ? 0.20f : 0.08f) * fade));
+            rt_->FillRoundedRectangle(D2D1::RoundedRect(plusRc_, 12 * k, 12 * k), brush_.Get());
+            brush_->SetColor(D2D1::ColorF(1, 1, 1, (plusHover_ ? 0.95f : 0.6f) * fade));
+            rt_->DrawLine(D2D1::Point2F(cxp - arm, cyp), D2D1::Point2F(cxp + arm, cyp), brush_.Get(), 2.0f * k, nullptr);
+            rt_->DrawLine(D2D1::Point2F(cxp, cyp - arm), D2D1::Point2F(cxp, cyp + arm), brush_.Get(), 2.0f * k, nullptr);
+            }
+    }
+
+    // The little "x" in the corner of the last card (when it can go)
+    D2D1_RECT_F XRect() const {
+        float k = dpi_ / 96.0f;
+        const D2D1_RECT_F& c = cards_.back();
+        return D2D1::RectF(c.right - 24 * k, c.top + 4 * k, c.right - 4 * k, c.top + 24 * k);
+    }
+    bool OnX(POINT p) const {
+        if (!canRemove_ || cards_.empty()) return false;
+        D2D1_RECT_F r = XRect();
+        return p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
+    }
+
+    int CardAt(POINT p) const {
+        if (spaces_.size() < 8 && p.x >= plusRc_.left && p.x < plusRc_.right && p.y >= plusRc_.top && p.y < plusRc_.bottom) return -2;
+        for (int i = 0; i < (int)spaces_.size() && i < (int)cards_.size(); ++i)
+            if (p.x >= cards_[i].left && p.x < cards_[i].right && p.y >= cards_[i].top && p.y < cards_[i].bottom) return i;
+        return -1;
+    }
+
+    void AddSpace() {
+        if (!EnhancedAddSpace()) return;
+        spaces_ = EnhancedSpacesInfo(mon_, &waSz_);
+        LayoutCards();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    void RemoveSpace() {
+        if (!EnhancedRemoveSpace()) return;
+        xHover_ = false;
+        spaces_ = EnhancedSpacesInfo(mon_, &waSz_);
+        LayoutCards();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    void PickSpace(int i) {
+        if (i < 0 || i >= (int)spaces_.size()) return;
+        g_pendMon = mon_;
+        g_pendSpace = spaces_[i].current ? 0 : spaces_[i].n;   // (the one you are on: just close)
+        CloseAll(nullptr);
+    }
+
     // In pixels (the render target is set to 96 DPI so it maps 1:1 to the thumbnails' coordinates)
     void Paint() {
         if (!Resources()) return;
@@ -344,6 +487,7 @@ private:
         float k = dpi_ / 96.0f;
         const auto& items = thumbs_.Items();
         bool settled = anim_ > 0.97f && !closing_;
+        if (!spaces_.empty()) PaintSpaces(k);
         for (int i = 0; i < (int)items.size(); ++i) {
             const RECT& r = items[i].cur;
             D2D1_RECT_F rf = D2D1::RectF((float)r.left, (float)r.top, (float)r.right, (float)r.bottom);
@@ -375,7 +519,7 @@ private:
             brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.8f));
             rt_->DrawTextW(t.c_str(), (UINT32)t.size(), font_.Get(), D2D1::RectF(0, sz.height / 2 - 20, sz.width, sz.height / 2 + 20), brush_.Get());
         }
-        if (FAILED(rt_->EndDraw())) { rt_.Reset(); bmps_.clear(); }
+        if (FAILED(rt_->EndDraw())) { rt_.Reset(); bmps_.clear(); snapBmps_.clear(); }
     }
 
     static LRESULT CALLBACK Proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -410,11 +554,17 @@ private:
             return 0;
         case WM_MOUSEMOVE: {
             int hv = self->thumbs_.HitTest(p);
-            if (hv != self->hover_) { self->hover_ = hv; InvalidateRect(h, nullptr, FALSE); }
+            int ch = self->CardAt(p);
+            bool ph = ch == -2, xh = self->OnX(p);
+            if (ph) ch = -1;
+            if (hv != self->hover_ || ch != self->cardHover_ || ph != self->plusHover_ || xh != self->xHover_) { self->hover_ = hv; self->cardHover_ = ch; self->plusHover_ = ph; self->xHover_ = xh; InvalidateRect(h, nullptr, FALSE); }
             return 0;
         }
         case WM_LBUTTONUP: {
             if (self->closing_) return 0;
+            if (self->OnX(p)) { self->RemoveSpace(); return 0; }
+            if (int ci = self->CardAt(p); ci == -2) { self->AddSpace(); return 0; }
+            else if (ci >= 0) { self->PickSpace(ci); return 0; }
             int hv = self->thumbs_.HitTest(p);
             CloseAll(hv >= 0 ? self->thumbs_.Items()[hv].h : nullptr);
             return 0;
@@ -424,6 +574,7 @@ private:
             if (self->closing_) return 0;
             int n = (int)self->thumbs_.Items().size();
             if (wp == VK_ESCAPE) CloseAll(nullptr);
+            else if (!self->spaces_.empty() && wp >= '1' && wp <= '8') self->PickSpace((int)(wp - '1'));
             else if (wp == VK_RETURN) CloseAll(self->sel_ >= 0 && self->sel_ < n ? self->thumbs_.Items()[self->sel_].h : nullptr);
             else if (n && (wp == VK_RIGHT || wp == VK_DOWN || wp == VK_TAB)) { self->sel_ = (self->sel_ + 1) % n; InvalidateRect(h, nullptr, FALSE); }
             else if (n && (wp == VK_LEFT || wp == VK_UP)) { self->sel_ = (self->sel_ + n - 1) % n; InvalidateRect(h, nullptr, FALSE); }
@@ -445,6 +596,15 @@ private:
     bool closing_ = false;
     HWND chosen_ = nullptr;
     int hover_ = -1, sel_ = -1;
+    std::vector<EnhancedSpaceInfo> spaces_;       // the workspace strip (empty: Enhanced Tiling is off)
+    SIZE waSz_{};
+    std::vector<D2D1_RECT_F> cards_;
+    D2D1_RECT_F plusRc_{};
+    float cardH_ = 0;
+    int stripBottom_ = 0;
+    bool plusHover_ = false, xHover_ = false, canRemove_ = false;
+    int cardHover_ = -1;
+    std::map<HWND, ComPtr<ID2D1Bitmap>> snapBmps_;
     ULONGLONG start_ = 0;
     ComPtr<ID2D1HwndRenderTarget> rt_;
     ComPtr<ID2D1SolidColorBrush> brush_;

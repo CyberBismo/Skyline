@@ -11,7 +11,7 @@
 En native macOS-aktig **topplinje + dock** for Windows 11, laget av brukeren («Yen-Zen & Cyber») sammen med Claude.
 Ren C++20, Win32 + Direct2D/DirectWrite + DWM. Ingen webview, ingen .NET, ingen installasjon. Én exe på ca. 0,9 MB.
 Lisens: **GNU GPL-3.0 eller senere**. Credits i appen: «Made by Yen-Zen & Cyber and a whole bunch of Claude».
-Skal legges ut gratis på GitHub. **Siste versjon: 2.40.5** (16. nov 2026).
+Skal legges ut gratis på GitHub. **Siste versjon: 2.42.0** (18. nov 2026; 2.40.5 er siste utgitte).
 
 > **Dette er prosjektet for Windows 11.** Skyline for Windows 10 er et **helt eget prosjekt** med egen kode, egen backup
 > (`Skyline-10-x.y-backup.zip`) og egen GitHub-pakke. Brukeren vil ha det slik for å holde det ryddig: ingen delt kode.
@@ -358,6 +358,65 @@ Alt nytt skal være lett: ingen kostnad før det brukes, hendelsesstyrt.
    kan legges på hot corner og hurtigtast.
 
 Gjør dem i omganger og send en ny versjon etter hver omgang (2.4, 2.5 …), så brukeren kan teste mellom hver.
+
+---
+
+## 6b. Status og neste økt (18. nov 2026)
+
+**Status:** Skyline 2.40.5 er ferdig og testet av brukeren (siste ting: autoskjult topplinje over maksimerte vinduer, Mission Control på alle skjermer).
+Alt er slått sammen i `CyberBismo/Skyline` (main) via pull request #1 fra forken `ZenForgeDev/Skyline`, og det finnes en GitHub-release `v2.40.5`
+med `Skyline-Setup-2.40.5.exe` (brukerens egen bygging). «Lars» (CyberBismo) styrer signeringen: den innebygde auto-oppdateringen går via
+`skyline.skybyn.com` og trenger en signert `latest.txt` laget med den private nøkkelen `skyline-signing.key` (`tools/release.py` / `sign-release.ps1`).
+Claude rører ikke nøkkelen. Brukeren sender Lars en melding når en ny versjon skal ut.
+
+**Arbeidsmapper:** kildekoden ligger i `C:\Dev\Skyline\Skyline-main\Skyline-main` (zip-nedlasting, ikke git) og i den klonede forken
+`C:\Users\ZenForge\Documents\GitHub\Skyline` (git, `origin` = ZenForgeDev/Skyline, `upstream` = CyberBismo/Skyline). Den installerte appen ligger i
+`%LocalAppData%\Programs\Skyline`. Claudes arbeidskopi: `/home/claude/work/Skyline` (git, bygges med `PATH=/tmp/llvm-mingw/bin:$PATH ./build.sh`; last ned llvm-mingw på nytt i ny container).
+
+**GitHub-rutine (virket 18. nov):** 1) kopier filene fra arbeidskopien til den klonede forken med `device_commit_files` (ny katalog under
+`/mnt/user-data/outputs` for hver commit, aldri samme `stagedPath` to ganger – ellers kommer gammelt innhold), 2) GitHub Desktop: ny gren,
+commit, Publish branch, Create pull request (nettleseren i Claude fyller ut og sender), 3) etter merge: ny release via
+`releases/new?tag=vX.Y.Z&target=main&title=…&body=…`, brukeren drar `Skyline-Setup-X.Y.Z.exe` inn selv (filopplasting går ikke via Claude).
+Claude har ingen GitHub-innlogging i skyen; `gh` virker ikke. Filene i arbeidskopien har LF, forken bruker CRLF – git normaliserer, ingen støy i diffen.
+
+**Prioritert rekkefølge (avtalt 18. nov):**
+1. **Enhanced Tiling** (første prioritet) – planen står i punkt 6 over («Neste (avtalt 16. nov 2026…)»). Egen bryter, av som standard, egne filer `enhancedtiling.cpp/.h`, `tiling.cpp` røres ikke.
+2. **Forhåndsvisning av minimerte vinduer i docken.** Windows tegner ikke live innhold for minimerte vinduer, så: ta et stillbilde (PrintWindow `PW_RENDERFULLCONTENT`)
+   i det vinduet minimeres (`EVENT_SYSTEM_MINIMIZESTART`, før det er borte) og vis det i dock-forhåndsvisningen på samme måte som for vanlige ikoner. Siste utseende, ikke live.
+   Vinduer som var minimert før Skyline startet får bare ikon og tittel. Gjenbruk `preview.cpp`. Bryter, av som standard.
+3. **Skrivebordsklokke (plugin, av som standard):** eget gjennomsiktig vindu som kan flyttes hvor som helst (posisjon huskes per skjerm), flott digital klokke med dato,
+   valg for 12/24 t, sekunder, ukenummer og noen stiler (tynn, fet, flip), «lås» så musa går gjennom, oppdatering én gang per sekund (ingen polling ellers).
+4. Resten av forslagene under, i den rekkefølgen brukeren velger.
+
+**Flere plugin-forslag (alle brytere, av som standard):**
+- Skrivebords-widgets på samme drabare vindu som klokka: måneds-kalender, vær, CPU/RAM/GPU-måler (se punkt 7 over), notatlapper.
+- Utklippshistorikk med søk og festede favoritter (se punkt 6 over: `AddClipboardFormatListener`, siste 20, bare i minnet).
+- Fokusmodus + pomodoro: timer i topplinja som demper varsler og skjuler dock/topplinje en stund.
+- Skjermbilde-verktøy: marker område, tegn på, kopier/lagre; evt. fargevelger og lupe.
+- Nattlys: varmere farger om kvelden, styrt av klokka.
+
+**Generelle forslag:**
+- Dock: stacks (finnes fra 2.19, kan utvides), varselprikker på ikoner, seksjon for nylige apper.
+- Topplinje: virtuelt-skrivebord-bryter og et lite varselsenter.
+- Startmeny: søk som også regner og konverterer enheter; egne hurtigtast-snarveier.
+- Innstillinger: eksport/import av hele oppsettet som én fil.
+- Allerede avtalt fra før: lukkeknapp (✕) i Mission Control ved hover; Claudes egen startmeny (VibeMenu-idéer i punkt 6).
+
+---
+
+## 6c. Enhanced Tiling – status (18. nov 2026, kveld)
+
+- **2.41.0 (omgang 1, testet OK av brukeren):** `enhancedtiling.cpp/.h` = egen motor (laget som `ETiler`, layout-tre per skjerm). Bryter `[Tiling] Enhanced=1` (Innstillinger → Tiling; «Automatisk tiling» må også være på). Levende resizing, hurtigtaster (Ctrl+Alt+Win+piler flytter skillelinje, +E lik størrelse), regler `[Tiling] Rules=exe=float, exe=monitor 2` (`space N` brukes fra 2.43.0). `tiling.cpp` er urørt; `EnhancedApply()` stopper den vanlige motoren mens Enhanced er på. Felles funksjoner for topplinjeknapp/meny: `TilingRunning()`, `TilingIsFloating()`, `TilingToggleFloat()`, `TilingSchedule()`.
+- **2.42.0 (omgang 2, ikke testet ennå):** skillelinjevinduer i gapene (hover lyser, dra = levende, dobbeltklikk = 50/50; `[Tiling] Dividers=1`), dra-for-å-snappe med forhåndsvisning (midten = bytt, kant = del; `[Tiling] Snap=1`). Dessuten: **dock på flere skjermer skjules nå også av vinduer som ikke er i fokus** (`AnyWindowOver` i `dock.cpp`, globale hendelser settes opp bare når det finnes mer enn én dock).
+- **2.43.0 (omgang 3, ikke testet ennå):** 4 arbeidsområder per skjerm (Ctrl+Alt+1–4 bytter på skjermen med musa, Ctrl+Alt+Shift+1–4 sender vinduet; aktivt tre i `trees_`, øvrige parkert i `parked_` med vinduene skjult via `ShowWindowAsync(SW_HIDE)` og `hidden_`; `ShowAllHidden()` i `Stop()`), hovedvindu (Ctrl+Alt+Enter), `space N`-regler. **2.43.1:** liten «1 2 3 4»-indikator i ett sekund ved bytte (`ShowSpaceToast`), liste over skjulte vinduer i `skyline-hidden.txt` ved siden av ini (vises igjen ved neste start etter krasj: `RecoverHidden`), og skjulte vinduer blir stående i docken (`IsTaskbarWindow` bruker `EnhancedIsHidden`; klikk går til riktig arbeidsområde via `EnhancedReveal`).
+- **2.43.2–2.43.3:** forhåndsvisning i docken for vinduer i andre arbeidsområder (stillbilde) og for minimerte vinduer med «minimer til dock» (`Dock::ShowMiniPreview`).
+- **2.44.0:** øyeblikksbilder tas nå i en bakgrunnstråd (`KickCapture`, `CaptureRaw`; før frøs synkron `PrintWindow` Skyline = sannsynlig årsak til «arbeidsområder virker plutselig ikke»). Oversikt over alle områder (Ctrl+Alt+O, `ToggleOverview`), knapp i topplinja (`Kind::Spaces` i `bar.cpp`; klikk = oversikt, høyreklikk = innstillinger). Arbeidsområder i Mission Control: rad øverst med områdene (`mission.cpp`, `EnhancedSpacesInfo`, klikk eller tast 1–8 = bytt; byttet skjer først etter at Mission Control er lukket).
+- **2.45.0 (omgang 4):** animasjon ~140 ms (`StartAnim`/`OnAnimTimer`, timer 0x7113, kun mens noe beveger seg; ikke ved live-drag/skillelinje, `noAnim_`) og fokus-følger-musa (`OnFocusTimer`, timer 0x7114, 120 ms, bare når bryteren er på og bare mellom flisede vinduer). Brytere `[Tiling] Animate=1`, `FocusFollowsMouse=0`.
+- **2.45.1–2.46.0:** pluss (+) i Mission Control legger til områder (4–8, `[Tiling] Spaces`), × på det siste fjerner det (vinduene flyttes til området før, `DropLastSpace`; minst 2). Hurtigtaster Ctrl+Alt+1–8 / +Shift. Ikon i topplinja: `[Tiling] SpacesIcon` 1 = stablede skjermer, 2 = skjerm med tall (valg i innstillinger).
+- **2.47.0:** forhåndsvisning av minimerte vinduer med ekte bilde: bilde tas ved `EVENT_SYSTEM_MINIMIZESTART` og når et vindu mister fokus (`EnhancedSnapshotKick`, bare med «minimer til dock»); `preview.cpp` bruker bildet i stedet for ikon. Virker uten Enhanced Tiling.
+- **2.48.x:** skrivebordsklokke som tillegg (`deskclock.cpp/.h`, Innstillinger → Tillegg; `[DeskClock] Enabled, Position, Size, Monitor`): gjennomsiktig, klikkgjennom, oppdateres én gang per minutt. Gjenstår for klokka: stiler, sekunder, ukenummer, 12/24 t, flytting med musa, huske posisjon per skjerm.
+- **Ikke testet av brukeren ennå:** alt fra 2.44.0 og oppover (bygget uten kjente feil per 2.48.2, men kjørt lite). Husk at Claude ikke kan bygge i skyen: brukeren bygger med `build.bat`. **Viktig:** bruk alltid ny `stagedPath`-katalog per `device_commit_files`, og kontroller etterpå med `device_stage_files` + `cmp` at filene på maskinen er like (samme sti to ganger ga gamle filer 18. nov).
+- **Forslag videre:** Ctrl+Alt+O og klokke-valgene i innstillingsinfo, flere klokkestiler, utklippshistorikk, fokusmodus/pomodoro.
 
 ---
 

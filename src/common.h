@@ -163,6 +163,7 @@ struct Settings {
     std::vector<std::wstring> pinned;     // exe paths or shell:AppsFolder\AUMID
     // tiling
     bool tilingEnabled = false;
+    bool enhancedTiling = false;          // use the Enhanced Tiling engine (enhancedtiling.cpp) instead of the plain one
     int tilingLayout = 0;                 // 0 BSP, 1 Master, 2 Columns, 3 Monocle
     int tilingGap = 8;
     bool tilingDockSpace = true;

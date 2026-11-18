@@ -2,6 +2,7 @@
 // Skyline dock — pinned + running apps along the bottom, native Win32/Direct2D.
 // Event driven: shell hook for windows, WinEvents for focus/moves, nothing polls.
 #include "dock.h"
+#include "enhancedtiling.h"
 #include "app.h"
 #include "menus.h"
 #include "settings.h"
@@ -55,7 +56,7 @@ bool IsAppsFolder(const std::wstring& t) {
 
 // Which windows belong on a taskbar — same rules Explorer uses.
 bool IsTaskbarWindow(HWND h) {
-    if (!IsWindowVisible(h)) return false;
+    if (!IsWindowVisible(h) && !EnhancedIsHidden(h)) return false;   // (hidden in another Enhanced Tiling workspace: still in the dock)
     LONG ex = GetWindowLongW(h, GWL_EXSTYLE);
     bool appWindow = (ex & WS_EX_APPWINDOW) != 0;
     if ((ex & WS_EX_TOOLWINDOW) && !appWindow) return false;
@@ -955,6 +956,7 @@ void Dock::PaintTile(Tile& t, float S, float base, float height, bool divider) {
 // Minimized windows in the dock (setting): little live pictures, like on a Mac
 void CALLBACK Dock::OnMinimize(HWINEVENTHOOK, DWORD, HWND h, LONG obj, LONG, DWORD, DWORD) {
     if (!h || obj != OBJID_WINDOW || !g_app.settings.dockMinimize) return;
+    if (!IsIconic(h)) EnhancedSnapshotKick(h, true);   // picture for the hover preview, taken while it is still on screen
     for (auto& d : g_app.docks)
         if (d && d->hwnd_) {
             SetTimer(d->hwnd_, T_MINIS, 40, nullptr);         // look once the window has settled
@@ -1473,7 +1475,20 @@ void Dock::UpdateMediaHover(POINT p) {
         bool on = x >= m.rc.left && x < m.rc.right;
         if (on != m.hover) { m.hover = on; m.target = on ? kHoverScale : 1.0f; miniChanged = true; }
     }
-    if (miniChanged) { StartAnimating(); UpdateLabel(); }
+    if (miniChanged) {
+        StartAnimating();
+        // a minimized window under the mouse: the same hover preview as an app icon gets (bigger picture, title, ×)
+        int mi = MiniHover();
+        if (g_app.settings.dockPreview && mi >= 0 && !dragging_) {
+            KillTimer(hwnd_, T_PREVIEWHIDE);
+            if (preview_.Visible()) ShowMiniPreview(mi);
+            else SetTimer(hwnd_, T_PREVIEW, 450, nullptr);
+        } else if (mi < 0 && previewMini_) {
+            KillTimer(hwnd_, T_PREVIEW);
+            if (preview_.Visible() && hover_ < 0) SetTimer(hwnd_, T_PREVIEWHIDE, 300, nullptr);   // time to reach it
+        }
+        UpdateLabel();
+    }
     bool in = mediaRc_.right > mediaRc_.left && x >= mediaRc_.left && x < mediaRc_.right;
     if (in == mediaHover_) return;
     mediaHover_ = in;
@@ -1637,6 +1652,44 @@ void Dock::StartMenuChanged(bool open) {
     }
 }
 
+// With a dock on every screen: does ANY ordinary window cover this dock, focused or not?
+static bool AnyWindowOver(const RECT& home) {
+    struct Ctx { RECT home; bool hit; } c{home, false};
+    EnumWindows([](HWND w, LPARAM lp) -> BOOL {
+        auto* c = reinterpret_cast<Ctx*>(lp);
+        if (!IsWindowVisible(w) || IsIconic(w)) return TRUE;
+        RECT r{}, i;
+        if (FAILED(DwmGetWindowAttribute(w, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof r))) GetWindowRect(w, &r);
+        if (!IntersectRect(&i, &r, &c->home)) return TRUE;
+        BOOL cloaked = FALSE;
+        DwmGetWindowAttribute(w, DWMWA_CLOAKED, &cloaked, sizeof cloaked);
+        if (cloaked) return TRUE;
+        LONG ex = GetWindowLongW(w, GWL_EXSTYLE);
+        bool appWindow = (ex & WS_EX_APPWINDOW) != 0;
+        if (((ex & WS_EX_TOOLWINDOW) && !appWindow) || (ex & WS_EX_NOACTIVATE)) return TRUE;
+        if (GetWindow(w, GW_OWNER) && !appWindow) return TRUE;
+        if (GetWindowTextLengthW(w) == 0) return TRUE;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(w, &pid);
+        if (pid == GetCurrentProcessId()) return TRUE;
+        wchar_t cls[64] = {};
+        GetClassNameW(w, cls, 64);
+        if (!lstrcmpW(cls, L"Progman") || !lstrcmpW(cls, L"WorkerW") || !lstrcmpW(cls, L"Shell_TrayWnd") ||
+            !lstrcmpW(cls, L"Shell_SecondaryTrayWnd"))
+            return TRUE;
+        if (IsShellFlyout(w)) return TRUE;
+        c->hit = true;
+        return FALSE;
+    }, (LPARAM)&c);
+    return c.hit;
+}
+
+// Windows moving, minimizing, opening or closing on ANY screen: every dock looks again (smart hide with several docks).
+void CALLBACK Dock::OnAnyWindowChange(HWINEVENTHOOK, DWORD, HWND, LONG obj, LONG child, DWORD, DWORD) {
+    if (obj != OBJID_WINDOW || child != CHILDID_SELF) return;
+    for (auto& d : g_app.docks) SetTimer(d->hwnd_, T_EVAL, 80, nullptr);
+}
+
 void Dock::Evaluate() {
     if (fullscreen_) return;
     if (Flyouts::StackOpen()) { SetShown(true); return; }   // its stack is open above it: stay
@@ -1677,6 +1730,18 @@ void Dock::Evaluate() {
             RECT i;
             overlap = IntersectRect(&i, &r, &home_) != FALSE;
         }
+    }
+    if (!overlap && g_app.docks.size() > 1) {
+        // With a dock on several screens, a window covering a dock hides it even when it is not in focus
+        // (or the focus is on another screen). The hooks are only set up in that case.
+        static bool hooked = false;
+        if (!hooked) {
+            hooked = true;
+            SetWinEventHook(EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND, nullptr, OnAnyWindowChange, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+            SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND, nullptr, OnAnyWindowChange, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+            SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, nullptr, OnAnyWindowChange, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        }
+        overlap = AnyWindowOver(home_);
     }
     SetShown(!overlap);
 }
@@ -1764,16 +1829,31 @@ void Dock::ShowPreview(int idx) {
     for (HWND h : a.windows) if (IsWindow(h)) live.push_back(h);
     if (live.empty()) { HidePreview(); return; }
     previewIdx_ = idx;
+    previewMini_ = nullptr;
     int cx = home_.left + (int)((a.rc.left + a.rc.right) / 2 * dpi_ / 96.0f);
     int bottom = home_.top - MulDiv(8, dpi_, 96);
     preview_.Show(hwnd_, live, a.img.Get(), cx, bottom, dpi_);
     UpdateLabel();   // the name is in the preview now
 }
 
+// Hover preview of one minimized window (the tiles next to the apps, setting "minimize to dock").
+void Dock::ShowMiniPreview(int mi) {
+    if (mi < 0 || mi >= (int)minis_.size() || !IsWindow(minis_[mi].h)) { HidePreview(); return; }
+    Mini& m = minis_[mi];
+    if (m.h == previewMini_ && preview_.Visible()) return;
+    previewIdx_ = -1;
+    previewMini_ = m.h;
+    int cx = home_.left + (int)((m.rc.left + m.rc.right) / 2 * dpi_ / 96.0f);
+    int bottom = home_.top - MulDiv(8, dpi_, 96);
+    preview_.Show(hwnd_, {m.h}, m.icon.Get(), cx, bottom, dpi_);
+    UpdateLabel();
+}
+
 void Dock::HidePreview() {
     KillTimer(hwnd_, T_PREVIEW);
     KillTimer(hwnd_, T_PREVIEWHIDE);
     previewIdx_ = -1;
+    previewMini_ = nullptr;
     if (preview_.Visible()) { preview_.Hide(); UpdateLabel(); }
 }
 
@@ -1820,6 +1900,12 @@ void Dock::Activate(App& a) {
     std::vector<HWND> live;
     for (HWND h : a.windows) if (IsWindow(h)) live.push_back(h);
     if (live.empty()) { Launch(a); return; }
+    {   // windows in another Enhanced Tiling workspace: clicking goes there (unless the app also has a window in view)
+        std::vector<HWND> inView;
+        for (HWND h : live) if (!EnhancedIsHidden(h)) inView.push_back(h);
+        if (inView.empty()) { EnhancedReveal(live.front()); return; }
+        live = inView;
+    }
     // Clicking the app you're in minimizes it, like the Windows taskbar.
     if (std::find(live.begin(), live.end(), fg_) != live.end() && !IsIconic(fg_)) {
         ShowWindow(fg_, SW_MINIMIZE);
@@ -1866,6 +1952,7 @@ void Dock::ContextMenu(int idx, POINT screen) {
 
     if (cmd >= CmdWin && cmd < CmdWin + (int)wins.size()) {
         HWND w = wins[cmd - CmdWin];
+        if (EnhancedReveal(w)) return;   // it was in another workspace: we went there
         if (IsIconic(w)) ShowWindow(w, SW_RESTORE);
         SetForegroundWindow(w);
     } else if (cmd == CmdOpen) {
@@ -2072,10 +2159,11 @@ LRESULT Dock::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         case T_PREVIEW:
             KillTimer(hwnd_, T_PREVIEW);
             if (hover_ >= 0 && shown_ && !dragging_) ShowPreview(hover_);
+            else if (hover_ < 0 && MiniHover() >= 0 && shown_ && !dragging_) ShowMiniPreview(MiniHover());
             break;
         case T_PREVIEWHIDE:
             KillTimer(hwnd_, T_PREVIEWHIDE);
-            if (preview_.MouseInside() || hover_ >= 0) break;   // made it over there, or back on an icon
+            if (preview_.MouseInside() || hover_ >= 0 || MiniHover() >= 0) break;   // made it over there, or back on an icon / minimized window
             HidePreview();
             if (!mouseInside_) SetTimer(hwnd_, T_HIDEDELAY, 300, nullptr);
             break;

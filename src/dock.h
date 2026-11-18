@@ -60,6 +60,7 @@ private:
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
     static LRESULT CALLBACK TriggerProc(HWND, UINT, WPARAM, LPARAM);
     static void CALLBACK OnLocation(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD);
+    static void CALLBACK OnAnyWindowChange(HWINEVENTHOOK, DWORD, HWND h, LONG obj, LONG child, DWORD, DWORD);
     static void CALLBACK OnCloak(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD);
     LRESULT Handle(UINT msg, WPARAM wp, LPARAM lp);
 
@@ -141,6 +142,8 @@ private:
     void PaintMinis(float S, float base, float height, bool divider);
     void RenderBadges();
     int MiniHover() const;
+    void ShowMiniPreview(int mi);   // hover preview of a minimized window
+    HWND previewMini_ = nullptr;    // the minimized window the preview shows (if it is one)
     void MiniMenu(int i, POINT screen);
     HWND badges_ = nullptr;
     HDC badgeDC_ = nullptr;

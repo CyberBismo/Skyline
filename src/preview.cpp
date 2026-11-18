@@ -3,6 +3,7 @@
 #include "preview.h"
 #include "app.h"
 #include "icons.h"
+#include "enhancedtiling.h"
 
 namespace {
 constexpr wchar_t kClass[] = L"SkylineDockPreview";
@@ -107,6 +108,7 @@ void DockPreview::Show(HWND owner, const std::vector<HWND>& wins, IWICBitmapSour
         Item it;
         it.win = w;
         it.iconic = IsIconic(w) != FALSE;
+        if (EnhancedIsHidden(w) || it.iconic) it.snap = EnhancedSnapshot(w);   // no live picture of those: the saved one
         wchar_t title[256] = {};
         GetWindowTextW(w, title, 256);
         it.title = title;
@@ -136,6 +138,7 @@ void DockPreview::Show(HWND owner, const std::vector<HWND>& wins, IWICBitmapSour
 
     // Live thumbnails, drawn by DWM on top of our window
     for (auto& it : items_) {
+        if (EnhancedIsHidden(it.win) || it.snap) continue;   // hidden/minimized: no live picture exists, the saved one is painted instead
         if (FAILED(DwmRegisterThumbnail(hwnd_, it.win, &it.th))) { it.th = nullptr; continue; }
         DWM_THUMBNAIL_PROPERTIES p{};
         p.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_SOURCECLIENTAREAONLY | DWM_TNP_OPACITY;
@@ -218,7 +221,7 @@ void DockPreview::Paint() {
     if (!icon_ && iconSrc_) rt_->CreateBitmapFromWicBitmap(iconSrc_.Get(), nullptr, icon_.Put());
 
     for (int i = 0; i < (int)items_.size(); ++i) {
-        const Item& it = items_[i];
+        Item& it = items_[i];
         if (i == hover_) {
             brush_->SetColor(th.hover);
             rt_->FillRoundedRectangle(D2D1::RoundedRect(it.slot, 7, 7), brush_.Get());
@@ -245,13 +248,24 @@ void DockPreview::Paint() {
         // Behind the live thumbnail: a soft card with the app icon (what you see for minimized windows)
         brush_->SetColor(D2D1::ColorF(th.fg.r, th.fg.g, th.fg.b, 0.06f));
         rt_->FillRoundedRectangle(D2D1::RoundedRect(it.thumb, 4, 4), brush_.Get());
-        if (it.iconic && icon_) {
+        if (it.snap) {   // a window in another workspace: the picture taken when it was hidden
+            if (!it.snapBmp) rt_->CreateBitmapFromWicBitmap(it.snap.Get(), nullptr, it.snapBmp.Put());
+            if (it.snapBmp) rt_->DrawBitmap(it.snapBmp.Get(), it.thumb, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            else if (icon_) {
+                float cx = (it.thumb.left + it.thumb.right) / 2, cy = (it.thumb.top + it.thumb.bottom) / 2, s = 40;
+                DrawImageHQ(rt_.Get(), icon_.Get(), D2D1::RectF(cx - s / 2, cy - s / 2, cx + s / 2, cy + s / 2), 0.9f);
+            }
+        } else if (EnhancedIsHidden(it.win) && icon_) {   // hidden and no picture could be taken: the app icon
+            float cx = (it.thumb.left + it.thumb.right) / 2, cy = (it.thumb.top + it.thumb.bottom) / 2, s = 40;
+            DrawImageHQ(rt_.Get(), icon_.Get(), D2D1::RectF(cx - s / 2, cy - s / 2, cx + s / 2, cy + s / 2), 0.9f);
+        }
+        if (it.iconic && icon_ && !it.snap) {
             float cx = (it.thumb.left + it.thumb.right) / 2, cy = (it.thumb.top + it.thumb.bottom) / 2, s = 40;
             DrawImageHQ(rt_.Get(), icon_.Get(), D2D1::RectF(cx - s / 2, cy - s / 2, cx + s / 2, cy + s / 2), 0.9f);
         }
     }
     static int fails = 0;
-    if (FAILED(rt_->EndDraw())) { rt_.Reset(); brush_.Reset(); font_.Reset(); icon_.Reset(); if (++fails < 3) InvalidateRect(hwnd_, nullptr, FALSE); } else fails = 0;
+    if (FAILED(rt_->EndDraw())) { for (auto& i : items_) i.snapBmp.Reset(); rt_.Reset(); brush_.Reset(); font_.Reset(); icon_.Reset(); if (++fails < 3) InvalidateRect(hwnd_, nullptr, FALSE); } else fails = 0;
 }
 
 LRESULT CALLBACK DockPreview::WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -313,7 +327,7 @@ LRESULT DockPreview::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         if (i >= 0) {
             HWND w = items_[i].win;
             Hide();
-            if (IsWindow(w)) {
+            if (IsWindow(w) && !EnhancedReveal(w)) {   // (a window in another workspace: we go there instead)
                 if (IsIconic(w)) ShowWindow(w, SW_RESTORE);
                 SetForegroundWindow(w);
             }
