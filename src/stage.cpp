@@ -36,6 +36,7 @@ struct StashInfo {
     HMONITOR mon = nullptr;
     std::wstring exe;
     ULONGLONG seq = 0;   // when it was put away (bigger = later)
+    ULONGLONG tick = 0;   // when we asked the window to minimise (it gets a moment to do so)
     bool adopted = false; // already minimised by hand when Stage Manager started: it sits in the strip too, but is never un-minimised on its own
 };
 std::map<HWND, StashInfo> g_stash;                       // windows we minimised
@@ -45,7 +46,10 @@ std::map<HMONITOR, std::vector<HWND>> g_seenFront;       // the windows on show 
 std::map<HWND, std::wstring> g_exeCache;
 ULONGLONG g_seq = 1000000;   // (what adopted windows get is lower)
 HWND g_msg = nullptr;
-HWINEVENTHOOK g_hookDestroy = nullptr, g_hookMove = nullptr;
+HWINEVENTHOOK g_hookDestroy = nullptr, g_hookMove = nullptr, g_hookMin = nullptr, g_hookCloak = nullptr, g_hookShow = nullptr;
+std::map<HWND, ULONGLONG> g_noStash;   // windows that would not minimise (elevated or stubborn apps): left alone for a minute, then tried again
+std::map<HWND, HMONITOR> g_lastMon;   // the screen each window was last seen on (a minimised window remembers where it was, not where Windows keeps its restore place)
+std::set<HWND> g_young;   // windows of another app seen on show once (they are put away when seen a second time: gives a new window time to take the focus)
 bool g_refreshPending = false;
 
 std::wstring DirOfIni() {
@@ -86,6 +90,45 @@ bool IsDesktopClass(HWND h) {
     return !lstrcmpW(cls, L"Progman") || !lstrcmpW(cls, L"WorkerW") || !lstrcmpW(cls, L"Shell_TrayWnd") || !lstrcmpW(cls, L"Shell_SecondaryTrayWnd");
 }
 
+// Apps the user wants Stage Manager to leave alone: [StageManager] Exclude=steam.exe;discord.exe in skyline.ini (file names, ; separated)
+std::set<std::wstring> g_exclude;
+void LoadExclude() {
+    g_exclude.clear();
+    wchar_t buf[2048] = {};
+    GetPrivateProfileStringW(L"StageManager", L"Exclude", L"", buf, 2048, g_app.settings.path.c_str());
+    std::wstring all = buf, cur;
+    all += L';';
+    for (wchar_t c : all) {
+        if (c == L';' || c == L',') {
+            size_t a = cur.find_first_not_of(L" \t"), b = cur.find_last_not_of(L" \t");
+            if (a != std::wstring::npos) {
+                std::wstring n = ToLower(cur.substr(a, b - a + 1));
+                if (n.size() < 4 || n.compare(n.size() - 4, 4, L".exe") != 0) n += L".exe";
+                g_exclude.insert(n);
+            }
+            cur.clear();
+        } else cur += c;
+    }
+}
+
+// The process a window really belongs to. A Store app's window is owned by ApplicationFrameHost; the app itself lives in the CoreWindow inside it.
+// `resolved` = false when that CoreWindow cannot be found (yet): the answer may change later.
+DWORD OwningPid(HWND h, bool* resolved = nullptr) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (resolved) *resolved = true;
+    wchar_t cls[64] = {};
+    GetClassNameW(h, cls, 64);
+    if (!lstrcmpW(cls, L"ApplicationFrameWindow")) {
+        HWND core = FindWindowExW(h, nullptr, L"Windows.UI.Core.CoreWindow", nullptr);
+        DWORD cp = 0;
+        if (core) GetWindowThreadProcessId(core, &cp);
+        if (cp) pid = cp;
+        else if (resolved) *resolved = false;
+    }
+    return pid;
+}
+
 // A window Stage Manager may move around (same idea as Mission Control: a normal app window).
 bool AppWin(HWND h) {
     if (!h || !IsWindow(h) || !IsWindowVisible(h)) return false;   // (a minimised window is still "visible")
@@ -102,6 +145,7 @@ bool AppWin(HWND h) {
     DWORD pid = 0;
     GetWindowThreadProcessId(h, &pid);
     if (pid == GetCurrentProcessId()) return false;
+    pid = OwningPid(h);
     if (GetWindowTextLengthW(h) <= 0) return false;
     RECT r{};   // small windows (tool panes, popups) are not apps: they stay where they are
     if (IsIconic(h)) { WINDOWPLACEMENT wp{sizeof wp}; if (!GetWindowPlacement(h, &wp)) return false; r = wp.rcNormalPosition; }
@@ -113,15 +157,24 @@ bool AppWin(HWND h) {
     static const wchar_t* skip[] = {L"shellexperiencehost.exe", L"startmenuexperiencehost.exe", L"searchhost.exe", L"searchapp.exe", L"textinputhost.exe",
                                     L"lockapp.exe", L"widgets.exe", L"systemsettingsbroker.exe", L"applicationframehost.exe_"};
     for (const wchar_t* sname : skip) if (exe == sname) return false;
+    if (g_exclude.count(exe)) return false;   // an app the user told us to leave alone
+    auto ns = g_noStash.find(h);
+    if (ns != g_noStash.end()) { if (GetTickCount64() < ns->second) return false; g_noStash.erase(ns); }
     return true;
 }
 
+std::set<HWND> g_exeUnresolved;   // Store app windows whose real app was not found yet (asked again next time)
 const std::wstring& ExeOf(HWND h) {
     auto it = g_exeCache.find(h);
     if (it == g_exeCache.end()) {
-        DWORD pid = 0;
-        GetWindowThreadProcessId(h, &pid);
+        bool ok = true;
+        DWORD pid = OwningPid(h, &ok);
         it = g_exeCache.emplace(h, ToLower(ProcessImagePath(pid))).first;
+        if (!ok) g_exeUnresolved.insert(h);
+    } else if (!g_exeUnresolved.empty() && g_exeUnresolved.count(h)) {
+        bool ok = true;
+        DWORD pid = OwningPid(h, &ok);
+        if (ok) { it->second = ToLower(ProcessImagePath(pid)); g_exeUnresolved.erase(h); }
     }
     return it->second;
 }
@@ -130,6 +183,9 @@ HMONITOR MonOf(HWND h) {
     auto s = g_stash.find(h);
     if (s != g_stash.end()) return s->second.mon;
     if (IsIconic(h)) {
+        auto lm = g_lastMon.find(h);
+        MONITORINFO lmi{sizeof lmi};
+        if (lm != g_lastMon.end() && GetMonitorInfoW(lm->second, &lmi)) return lm->second;
         WINDOWPLACEMENT wp{sizeof wp};
         if (GetWindowPlacement(h, &wp)) return MonitorFromRect(&wp.rcNormalPosition, MONITOR_DEFAULTTONEAREST);
     }
@@ -210,7 +266,11 @@ void TakeForeground(HWND h) {
 void SaveStash() {
     std::wstring path = DirOfIni() + L"stage-stash.txt";
     std::string out;
-    for (auto& [w, si] : g_stash) if (!si.adopted) out += std::to_string((unsigned long long)(ULONG_PTR)w) + "\n";
+    for (auto& [w, si] : g_stash) if (!si.adopted) {   // (the window and its process: a window number can be reused by another window later)
+        DWORD pid = 0;
+        GetWindowThreadProcessId(w, &pid);
+        out += std::to_string((unsigned long long)(ULONG_PTR)w) + " " + std::to_string((unsigned long)pid) + "\n";
+    }
     if (out.empty()) { DeleteFileW(path.c_str()); return; }
     HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return;
@@ -230,9 +290,14 @@ void RestoreLeftovers() {
     DeleteFileW(path.c_str());
     const char* p = buf;
     while (*p) {
-        unsigned long long v = strtoull(p, nullptr, 10);
+        char* e1 = nullptr;
+        unsigned long long v = strtoull(p, &e1, 10);
+        unsigned long want = e1 ? strtoul(e1, nullptr, 10) : 0;
         HWND w = (HWND)(ULONG_PTR)v;
-        if (v && IsWindow(w) && IsIconic(w)) { ShowWindowAsync(w, SW_RESTORE); Log(L"leftover restored " + Short(w)); }
+        DWORD pid = 0;
+        if (v && IsWindow(w)) GetWindowThreadProcessId(w, &pid);
+        // only the very same window (same process): never an unrelated window that got the same number after a restart
+        if (v && IsWindow(w) && want && pid == want && IsIconic(w)) { ShowWindowAsync(w, SW_RESTORE); Log(L"leftover restored " + Short(w)); }
         const char* nl = strchr(p, '\n');
         if (!nl) break;
         p = nl + 1;
@@ -257,6 +322,14 @@ public:
     explicit Strip(HMONITOR m) : mon_(m) {}
     ~Strip() { Destroy(); }
     HMONITOR Mon() const { return mon_; }
+    std::wstring State() const {   // for stage-debug.txt: is the strip there, on show, waiting for the mouse?
+        std::wstring t = hwnd_ ? L"window" : L"no window";
+        if (hwnd_ && IsWindowVisible(hwnd_)) t += L", visible";
+        if (revealed_) t += L", shown";
+        if (hoverOnly_) t += L", waits for the mouse";
+        if (trigger_ && IsWindowVisible(trigger_)) t += L", edge trigger on";
+        return t;
+    }
 
     void Configure(std::vector<Card> cards, bool hoverOnly, bool suppressed) {
         cards_ = std::move(cards);
@@ -735,6 +808,12 @@ bool ActiveCovers(HMONITOR m) {
     return false;
 }
 
+int ScreenNo(HMONITOR m) {   // 1, 2, 3 … in the order Windows lists the screens (for the log only)
+    auto v = Monitors();
+    for (size_t i = 0; i < v.size(); ++i) if (v[i] == m) return (int)i + 1;
+    return 0;
+}
+
 void StashWindow(HWND w, HMONITOR m) {
     if (g_stash.count(w)) return;
     EnhancedSnapshotNow(w);   // a minimised window can't be drawn any more: the picture is taken now
@@ -742,8 +821,9 @@ void StashWindow(HWND w, HMONITOR m) {
     si.mon = m;
     si.exe = ExeOf(w);
     si.seq = ++g_seq;
+    si.tick = GetTickCount64();
     g_stash[w] = si;
-    Log(L"put away " + Short(w) + L" (" + si.exe.substr(si.exe.find_last_of(L'\\') + 1) + L")");
+    Log(L"put away " + Short(w) + L" (" + si.exe.substr(si.exe.find_last_of(L'\\') + 1) + L") on screen " + std::to_wstring(ScreenNo(m)));
     if (IsHungAppWindow(w)) ShowWindowAsync(w, SW_SHOWMINNOACTIVE);
     else ShowWindow(w, SW_SHOWMINNOACTIVE);
 }
@@ -771,7 +851,7 @@ void SwitchGroup(HMONITOR m, const std::wstring& exe, HWND prefer) {
     }
     MakeRoom(m);
     SaveStash();
-    Log(L"group " + exe.substr(exe.find_last_of(L'\\') + 1) + L" in front; put away now: " + std::to_wstring(g_stash.size()));
+    Log(L"group " + exe.substr(exe.find_last_of(L'\\') + 1) + L" in front on screen " + std::to_wstring(ScreenNo(m)) + L"; put away now: " + std::to_wstring(g_stash.size()));
     if (prefer && IsWindow(prefer) && !IsIconic(prefer) && GetForegroundWindow() != prefer) TakeForeground(prefer);
 }
 
@@ -805,6 +885,11 @@ std::vector<Card> BuildCards(HMONITOR m) {
 }
 
 // For finding out why nothing shows: what Stage Manager sees, written next to skyline.ini (stage-debug.txt, overwritten each time)
+int StashCount(HMONITOR m) {
+    int n = 0;
+    for (auto& kv : g_stash) if (kv.second.mon == m) ++n;
+    return n;
+}
 void DebugDump(const std::vector<HMONITOR>& mons) {
     std::wstring dir = g_app.settings.path;
     size_t bs = dir.find_last_of(L"\\/");
@@ -814,7 +899,14 @@ void DebugDump(const std::vector<HMONITOR>& mons) {
         RECT r = MonRect(m);
         out += L"screen " + std::to_wstring(r.left) + L"," + std::to_wstring(r.top) + L" " + std::to_wstring(r.right - r.left) + L"x" + std::to_wstring(r.bottom - r.top) +
                L" game=" + std::to_wstring((int)GameOn(m)) + L" windows=" + std::to_wstring(WindowsOn(m, false).size()) + L" cards=" + std::to_wstring(BuildCards(m).size()) +
-               L" active=" + g_active[m] + L"\r\n";
+               L" stash=" + std::to_wstring(StashCount(m)) + L" covers=" + std::to_wstring((int)ActiveCovers(m)) + L" active=" + g_active[m] + L"\r\n";
+        auto st = g_strips.find(m);
+        out += L"    strip: " + std::wstring(st == g_strips.end() ? L"none" : st->second->State()) + L"\r\n";
+    }
+    for (auto& [w, si] : g_stash) {
+        wchar_t t[50] = {};
+        if (IsWindow(w)) GetWindowTextW(w, t, 50);
+        out += L"  stash: screen " + std::to_wstring(ScreenNo(si.mon)) + L" " + si.exe.substr(si.exe.find_last_of(L'\\') + 1) + L" \"" + t + L"\"" + (si.adopted ? L" (adopted)" : L"") + (IsIconic(w) ? L"" : L" NOT MINIMISED") + L"\r\n";
     }
     int n = 0;
     std::pair<std::wstring*, int*> ctx(&out, &n);
@@ -831,10 +923,14 @@ void DebugDump(const std::vector<HMONITOR>& mons) {
         std::wstring exe = ProcessImagePath(pid);
         size_t b = exe.find_last_of(L'\\');
         if (b != std::wstring::npos) exe = exe.substr(b + 1);
-        *o->first += L"  [" + std::wstring(AppWin(h) ? L"APP" : L"no ") + L"] " + exe + L" \"" + t + L"\" " + std::to_wstring(r.right - r.left) + L"x" + std::to_wstring(r.bottom - r.top) + (IsIconic(h) ? L" min" : L"") + L"\r\n";
+        *o->first += L"  [" + std::wstring(AppWin(h) ? L"APP" : L"no ") + L"] " + exe + L" \"" + t + L"\" " + std::to_wstring(r.right - r.left) + L"x" + std::to_wstring(r.bottom - r.top) + (IsIconic(h) ? L" min" : L"") +
+                    (AppWin(h) ? L" -> screen " + std::to_wstring(ScreenNo(MonOf(h))) : L"") + L"\r\n";
         ++*o->second;
         return TRUE;
     }, (LPARAM)&ctx);
+    static std::wstring last;
+    if (out == last) return;   // (nothing new: no writing)
+    last = out;
     HANDLE f = CreateFileW((dir + L"stage-debug.txt").c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f != INVALID_HANDLE_VALUE) {
         DWORD w = 0;
@@ -847,6 +943,51 @@ void DebugDump(const std::vector<HMONITOR>& mons) {
     }
 }
 
+// "Include minimised windows" (a choice in the settings): apps minimised by hand are in the strip too
+void SyncAdopted();
+
+// The screen a window belongs to, looked up fresh (the screen handles can change when a screen sleeps, is plugged in or out)
+HMONITOR FreshMon(HWND w) {
+    WINDOWPLACEMENT wp{sizeof wp};
+    if (IsWindow(w) && GetWindowPlacement(w, &wp)) return MonitorFromRect(&wp.rcNormalPosition, MONITOR_DEFAULTTONEAREST);
+    return MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+}
+
+// More than one app on show on a screen (a window dragged over from another screen, or one that opened without taking the focus):
+// the app with the focus stays (else the one that was in front) and the others are put away, but only when seen twice
+// so that a window that is just opening gets time to take the focus. Returns true when a second look is needed.
+bool Reconcile(HMONITOR m) {
+    std::vector<HWND> shown;
+    std::set<std::wstring> exes;
+    for (HWND w : WindowsOn(m, false)) if (!g_stash.count(w)) { shown.push_back(w); exes.insert(ExeOf(w)); }
+    std::set<HWND> odd;
+    std::wstring keep;
+    if (exes.size() >= 2) {
+        HWND fg = GetForegroundWindow();
+        if (fg && AppWin(fg) && !IsIconic(fg) && !g_stash.count(fg) && MonOf(fg) == m && exes.count(ExeOf(fg))) keep = ExeOf(fg);
+        else if (exes.count(g_active[m])) keep = g_active[m];
+        else keep = ExeOf(shown[0]);
+        for (HWND w : shown) if (ExeOf(w) != keep) odd.insert(w);
+    }
+    if (exes.size() == 1 && g_active[m] != *exes.begin()) { g_active[m] = *exes.begin(); TouchMru(m, g_active[m]); }   // (only one app on show: that is the one in front)
+    for (auto it = g_young.begin(); it != g_young.end();)   // no longer an odd one out (or gone)
+        it = (!IsWindow(*it) || (MonOf(*it) == m && !odd.count(*it))) ? g_young.erase(it) : std::next(it);
+    bool pending = false, did = false;
+    for (HWND w : odd) {
+        if (!g_young.count(w)) { g_young.insert(w); pending = true; continue; }
+        Log(L"second app on show, put away " + Short(w));
+        StashWindow(w, m);
+        g_young.erase(w);
+        did = true;
+    }
+    if (did) {
+        if (g_active[m] != keep) { g_active[m] = keep; TouchMru(m, keep); }
+        MakeRoom(m);
+        SaveStash();
+    }
+    return pending;
+}
+
 void Refresh() {
     if (!g_on) return;
     g_refreshPending = false;
@@ -855,19 +996,39 @@ void Refresh() {
         if (std::find(mons.begin(), mons.end(), it->first) == mons.end()) it = g_strips.erase(it);
         else ++it;
     }
+    for (auto& kv : g_stash)   // a screen handle that no longer exists (screen slept / unplugged / changed): look the screen up again
+        if (std::find(mons.begin(), mons.end(), kv.second.mon) == mons.end()) { kv.second.mon = FreshMon(kv.first); Log(L"screen changed, moved " + Short(kv.first)); }
+    for (auto it = g_active.begin(); it != g_active.end();) it = std::find(mons.begin(), mons.end(), it->first) == mons.end() ? g_active.erase(it) : std::next(it);
+    for (auto it = g_mru.begin(); it != g_mru.end();) it = std::find(mons.begin(), mons.end(), it->first) == mons.end() ? g_mru.erase(it) : std::next(it);
+    for (auto it = g_seenFront.begin(); it != g_seenFront.end();) it = std::find(mons.begin(), mons.end(), it->first) == mons.end() ? g_seenFront.erase(it) : std::next(it);
+    bool slow = false;
+    for (auto it = g_noStash.begin(); it != g_noStash.end();) it = !IsWindow(it->first) ? g_noStash.erase(it) : std::next(it);
     for (auto it = g_stash.begin(); it != g_stash.end();) {   // closed, or brought back by hand
-        if (!IsWindow(it->first) || !IsIconic(it->first)) {
-            Log(std::wstring(IsWindow(it->first) ? L"no longer minimised, dropped " : L"gone, dropped ") + (IsWindow(it->first) ? Short(it->first) : L""));
+        if (IsWindow(it->first) && !it->second.adopted && !IsIconic(it->first) && IsWindowVisible(it->first)) {
+            // asked to minimise but still on show: slow app (look again soon) or one that will not (elevated …): then it is left alone for a minute
+            if (GetTickCount64() - it->second.tick < 1500) { slow = true; ++it; continue; }
+            Log(L"would not minimise, left alone " + Short(it->first));
+            g_noStash[it->first] = GetTickCount64() + 60000;
+            it = g_stash.erase(it);
+            continue;
+        }
+        if (!IsWindow(it->first) || !IsIconic(it->first) || !IsWindowVisible(it->first)) {   // (a window that hid itself, e.g. in the tray, can't be shown by a click)
+            Log(std::wstring(IsWindow(it->first) ? L"no longer minimised or hidden, dropped " : L"gone, dropped ") + (IsWindow(it->first) ? Short(it->first) : L""));
             it = g_stash.erase(it);
         } else ++it;
     }
+    for (auto it = g_lastMon.begin(); it != g_lastMon.end();) it = IsWindow(it->first) ? std::next(it) : g_lastMon.erase(it);
     for (auto it = g_exeCache.begin(); it != g_exeCache.end();) it = IsWindow(it->first) ? std::next(it) : g_exeCache.erase(it);
+    for (auto it = g_exeUnresolved.begin(); it != g_exeUnresolved.end();) it = IsWindow(*it) ? std::next(it) : g_exeUnresolved.erase(it);
     bool hiddenMode = g_app.settings.stageMode == 1;
-    bool again = false;
+    bool again = false, second = false;
+    if (g_app.settings.stageMinimized) SyncAdopted();   // (apps minimised by hand since last time)
     for (HMONITOR m : mons) {
         bool game = GameOn(m);
+        if (!game && Reconcile(m)) second = true;
         // nothing left in front on this screen (its last window was closed): the newest put-away app comes forward
         auto wins = WindowsOn(m, false);
+        for (HWND w : wins) g_lastMon[w] = m;
         bool closedLast = false;   // only when a window in front was really CLOSED (not just minimised by hand, not a click on the desktop)
         for (HWND w : g_seenFront[m]) if (!IsWindow(w)) closedLast = true;
         g_seenFront[m] = wins;
@@ -881,11 +1042,13 @@ void Refresh() {
         }
         auto& st = g_strips[m];
         if (!st) st = std::make_unique<Strip>(m);
-        bool cover = !hiddenMode && !game && ActiveCovers(m);
+        bool cover = !hiddenMode && !game && !g_app.settings.stageShowOver && ActiveCovers(m);
         st->Configure(BuildCards(m), hiddenMode || cover, game);
     }
     DebugDump(mons);
     if (again) Schedule(120);
+    else if (second) Schedule(600);   // a second look at a window that is not in the strip yet
+    else if (slow) Schedule(500);     // a window that was asked to minimise: has it done so?
 }
 
 void CALLBACK DestroyHook(HWINEVENTHOOK, DWORD, HWND h, LONG obj, LONG, DWORD, DWORD) {
@@ -897,8 +1060,18 @@ void CALLBACK DestroyHook(HWINEVENTHOOK, DWORD, HWND h, LONG obj, LONG, DWORD, D
     }
 }
 void CALLBACK MoveHook(HWINEVENTHOOK, DWORD, HWND, LONG obj, LONG, DWORD, DWORD) {
-    if (!g_on || obj != OBJID_WINDOW || g_stash.empty()) return;
-    Schedule(200);   // a window was moved: it may now cover the strip (or no longer)
+    if (!g_on || obj != OBJID_WINDOW) return;
+    Schedule(200);   // a window was moved: it may now cover the strip (or no longer), or sit on another screen now
+}
+void CALLBACK ShowHook(HWINEVENTHOOK, DWORD, HWND h, LONG obj, LONG child, DWORD, DWORD) {
+    if (!g_on || obj != OBJID_WINDOW || child != CHILDID_SELF || !h || g_refreshPending) return;
+    if (GetAncestor(h, GA_PARENT) != GetDesktopWindow()) return;   // only top-level windows
+    g_refreshPending = true;
+    Schedule(500);   // a new window is on show (it may not take the focus): look at it in a moment (once for many)
+}
+void CALLBACK MinHook(HWINEVENTHOOK, DWORD, HWND, LONG obj, LONG, DWORD, DWORD) {
+    if (!g_on || obj != OBJID_WINDOW) return;
+    Schedule(250);   // something was minimised or brought back (by hand, from the dock …): look again
 }
 
 LRESULT CALLBACK MsgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -938,14 +1111,19 @@ void Start() {
     g_msg = CreateWindowExW(0, L"SkylineStageMsg", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, g_app.hinst, nullptr);
     if (!g_msg) return;
     g_on = true;
+    LoadExclude();
     Log(L"start");
     RestoreLeftovers();
     g_hookDestroy = SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY, nullptr, DestroyHook, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     g_hookMove = SetWinEventHook(EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND, nullptr, MoveHook, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    g_hookMin = SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND, nullptr, MinHook, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    g_hookCloak = SetWinEventHook(EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED, nullptr, MinHook, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    g_hookShow = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, nullptr, ShowHook, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     // From now on: on every screen the app in front stays, the other apps are put away
     for (HMONITOR m : Monitors()) {
         if (GameOn(m)) continue;
         auto wins = WindowsOn(m, false);
+        for (HWND w : wins) g_lastMon[w] = m;
         if (wins.empty()) continue;
         HWND fg = GetForegroundWindow();
         HWND front = wins[0];
@@ -968,6 +1146,12 @@ void Stop() {
     g_on = false;
     if (g_hookDestroy) { UnhookWinEvent(g_hookDestroy); g_hookDestroy = nullptr; }
     if (g_hookMove) { UnhookWinEvent(g_hookMove); g_hookMove = nullptr; }
+    if (g_hookMin) { UnhookWinEvent(g_hookMin); g_hookMin = nullptr; }
+    if (g_hookCloak) { UnhookWinEvent(g_hookCloak); g_hookCloak = nullptr; }
+    if (g_hookShow) { UnhookWinEvent(g_hookShow); g_hookShow = nullptr; }
+    g_noStash.clear();
+    g_lastMon.clear();
+    g_young.clear();
     std::vector<HWND> back;
     for (auto& [w, si] : g_stash) if (!si.adopted) back.push_back(w);
     for (HWND w : back) UnstashWindow(w);   // everything we put away comes back (what was minimised by hand stays so)
@@ -991,7 +1175,7 @@ bool Enabled() { return g_app.settings.stageEnabled; }
 void Apply() {
     if (g_app.settings.stageEnabled && !g_on) Start();
     else if (!g_app.settings.stageEnabled && g_on) Stop();
-    else if (g_on) { SyncAdopted(); Refresh(); }   // (the way of showing it, or the minimised choice, may have changed)
+    else if (g_on) { LoadExclude(); SyncAdopted(); Refresh(); }   // (the way of showing it, or the minimised choice, may have changed)
 }
 
 void Shutdown() { Stop(); }
@@ -1000,6 +1184,7 @@ void OnForeground(HWND h) {
     if (!g_on || !h) return;
     if (!AppWin(h) || IsIconic(h)) { Schedule(150); return; }   // (a minimised window that "comes forward" is no work window: some apps do that in the background)
     HMONITOR m = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+    g_lastMon[h] = m;
     if (GameOn(m)) { Schedule(150); return; }   // a game screen: hands off
     const std::wstring& exe = ExeOf(h);
     auto it = g_active.find(m);
