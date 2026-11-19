@@ -950,6 +950,12 @@ void SettingsWindow::BuildPage(SettingsPage pg) {
                [&s] { return s.stageMode; },
                [this, &s](int v) { s.stageMode = v == 1 ? 1 : 0; IniWrite(L"StageManager", L"Mode", s.stageMode); ScheduleApply(); });
         if (!s.stageEnabled) rows.back().enabled = false;
+        toggle(TR(L"Vis stripa selv om et vindu dekker den", L"Show the strip even when a window covers it"),
+               TR(L"Av (standard): stripa gjemmer seg når et maksimert vindu eller et vindu helt til venstre dekker den, og kommer fram når musa går helt til venstre. På: stripa ligger alltid synlig oppå vinduene (bare i vanlig modus).",
+                  L"Off (default): the strip hides when a maximised window, or one at the far left, covers it, and comes back when the mouse goes to the left edge. On: the strip always stays on top of the windows (normal mode only)."),
+               [&s] { return s.stageShowOver; },
+               [this, &s](bool v) { s.stageShowOver = v; IniWrite(L"StageManager", L"ShowOver", v ? 1 : 0); ScheduleApply(); });
+        if (!s.stageEnabled) rows.back().enabled = false;
         choice(TR(L"Kortet under musa", L"Card under the mouse"),
                TR(L"Hvordan kortet du peker på vises i stripa.", L"How the card you point at looks in the strip."),
                {TR(L"Dimmer de andre", L"Dim the others"), TR(L"Myk glød", L"Soft glow")},

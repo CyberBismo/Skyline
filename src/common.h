@@ -146,6 +146,7 @@ struct Settings {
     bool dockTrash = false;               // Recycle Bin in the dock (plugin)
     bool stageEnabled = false;            // Stage Manager (plugin): the app in front stays, the others sit in a strip at the left
     bool stageMinimized = false;          // Stage Manager: apps already minimised by hand are in the strip too (off = like a Mac)
+    bool stageShowOver = false;           // Stage Manager (normal mode): the strip stays on show even when a window covers its place
     int stageHover = 0;                   // Stage Manager: card under the mouse – 0 the others dim, 1 soft glow
     int stageMode = 0;                    // 0 always shown (like a Mac), 1 hidden until the mouse touches the left edge
     bool dockMinimize = false;            // minimised windows sit in the dock as little live pictures, like on a Mac

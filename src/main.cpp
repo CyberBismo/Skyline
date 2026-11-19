@@ -348,6 +348,7 @@ Settings LoadSettings() {
     s.missionWinTab = GetPrivateProfileIntW(L"MissionControl", L"WinTab", 1, p) != 0;
     s.stageEnabled = GetPrivateProfileIntW(L"StageManager", L"Enabled", 0, p) != 0;
     s.stageMode = GetPrivateProfileIntW(L"StageManager", L"Mode", 0, p) == 1 ? 1 : 0;
+    s.stageShowOver = GetPrivateProfileIntW(L"StageManager", L"ShowOver", 0, p) != 0;
     s.stageHover = GetPrivateProfileIntW(L"StageManager", L"Hover", 0, p) == 1 ? 1 : 0;
     s.stageMinimized = GetPrivateProfileIntW(L"StageManager", L"Minimized", 0, p) != 0;
     s.dockTrash = GetPrivateProfileIntW(L"Dock", L"Trash", 0, p) != 0;
@@ -1319,6 +1320,7 @@ static LRESULT CALLBACK CtlProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             g_displayPending = false;
             KillTimer(h, kTimerGameWait);
             g_app.RebuildBars(); g_app.RebuildDocks(); g_app.ApplyHotCorners();
+            StageManager::Apply();   // the screens changed: Stage Manager looks up its screens again
             CheckFullscreen();
             SetTimer(h, kTimerFullscreen, 300, nullptr);
             break;
